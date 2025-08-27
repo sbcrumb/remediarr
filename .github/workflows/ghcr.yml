@@ -3,7 +3,9 @@ name: Build & Publish to GHCR
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*.*.*' ]   # build versioned tags when you push e.g. v1.2.3
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -13,11 +15,16 @@ jobs:
   docker:
     runs-on: ubuntu-latest
 
+    env:
+      PLATFORMS: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+      VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.sha && format('sha-{0}', github.sha[0:7])) }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up QEMU
+        if: ${{ env.PLATFORMS == 'linux/amd64,linux/arm64' }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
@@ -35,9 +42,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # This gives you:
-          #   - ghcr.io/owner/repo:latest on main
-          #   - ghcr.io/owner/repo:v1.2.3 when tag v1.2.3 is pushed
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
@@ -45,11 +49,15 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          push: true
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: ${{ env.PLATFORMS }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
+
