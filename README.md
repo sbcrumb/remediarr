@@ -1,3 +1,6 @@
+[![Build & Publish to GHCR](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr.yml/badge.svg)](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr.yml)
+[![Container image](https://img.shields.io/badge/GHCR-ghcr.io%2Fsbcrumb%2Fremediarr-blue)](https://github.com/sbcrumb/remediarr/pkgs/container/remediarr)
+
 # Remediarr
 
 Remediarr is a lightweight webhook service that listens to **Jellyseerr issue webhooks** and automatically remediates common problems.
