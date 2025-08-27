@@ -1,12 +1,47 @@
-services:
   remediarr:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # --- Use published image from GHCR (recommended) ---
+    image: ghcr.io/sbcrumb/remediarr:latest
+
+    # --- Or build locally from source (uncomment to use) ---
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+
     container_name: remediarr
     restart: unless-stopped
+
+    # Load your configuration (copy .env.example -> .env and edit)
     env_file:
       - .env
-    # If you prefer a fixed port:
+
+    # Expose the webhook port
     ports:
       - "8189:8189"
+
+    # Health check (optional but helpful)
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8189/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Keep logs under control (optional)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Attach to Saltbox shared network (optional)
+    # networks:
+    #   - saltbox
+
+    # Saltbox label (optional)
+    # labels:
+    #   com.github.saltbox.saltbox_managed: "true"
+
+# Define the external Saltbox network if you uncomment it above
+# networks:
+#   saltbox:
+#     external: true
