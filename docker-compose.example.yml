@@ -1,0 +1,12 @@
+services:
+  remediarr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: remediarr
+    restart: unless-stopped
+    env_file:
+      - .env
+    # If you prefer a fixed port:
+    ports:
+      - "8189:8189"
