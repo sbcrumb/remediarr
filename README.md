@@ -219,9 +219,9 @@ SOFTWARE.
 
 If Remediarr saves you time, consider fueling more tinkering:
 
-- GitHub Sponsors: [https://github.com/sponsors/](https://github.com/sponsors/)  
-- Ko-fi: [https://ko-fi.com/](https://ko-fi.com/)  
-- Buy Me a Coffee: [https://www.buymeacoffee.com/](https://www.buymeacoffee.com/)  
+- GitHub Sponsors: https://github.com/sponsors/sbcrumb?preview=true  
+- Ko-fi: Coming Soon
+- Buy Me a Coffee: Coming Soon
 - Bitcoin (BTC): `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`  
 
 Thank you! 🚀
