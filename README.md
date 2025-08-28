@@ -232,3 +232,9 @@ If Remediarr saves you time, consider fueling more tinkering:
 - Bitcoin (BTC): `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`  
 
 Thank you! 🚀
+
+
+### Dev / Testing builds
+- Stable: `ghcr.io/sbcrumb/remediarr:latest`
+- Versioned: `ghcr.io/sbcrumb/remediarr:v0.1.7`
+- **Dev/testing**: `ghcr.io/sbcrumb/remediarr:dev` (updated on each push to the `dev` branch)
