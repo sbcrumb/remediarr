@@ -13,7 +13,11 @@ Remediarr is a lightweight webhook service that listens to **Jellyseerr issue we
 - **Gotify Notifications:** Optional push messages when an action is taken.
 - **Customization:** All keywords, comments, and behaviors are configurable in `.env`.
 
----
+##Settings Note
+Please set the webhook fire settings just to Issue Reported for now. If you select Comment resolved etc it will create a loop condition.
+Working on correcting it.
+<img width="913" height="690" alt="image" src="https://github.com/user-attachments/assets/5a3058c1-e26b-44dd-a7dc-9a32c5b94049" />
+
 
 ## Quick Start
 
