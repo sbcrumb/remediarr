@@ -456,10 +456,27 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
     comment = payload.get("comment") or {}
 
     # Filter to allowed events only
-    if not any(k in event for k in ALLOWED_EVENTS):
+# ---------------- Allowed Events Filtering ----------------
+    def _event_is_allowed(e: str) -> bool:
+        e = (e or "").lower()
+        # always ignore resolution/closing events
+        if any(bad in e for bad in ("resolved", "closed", "reopened")):
+            return False
+        # accept anything mentioning issue/comment
+        if "issue" in e or "comment" in e:
+            return True
+        return False
+
+    if ALLOWED_EVENTS:  # explicit env list
+        allowed = any(k in event for k in ALLOWED_EVENTS)
+    else:  # fallback heuristic
+        allowed = _event_is_allowed(event)
+
+    if not allowed:
         log.info("Skipping event due to type: %s", event)
         return {"ok": True, "skipped": True, "reason": f"ignored event '{event}'"}
 
+    # ---------------- Extract Media/Issue Info ----------------
     media_type = (media.get("media_type") or media.get("mediaType") or "").lower()
     issue_type = (issue.get("issue_type") or "").lower()
 
@@ -470,7 +487,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
     ]).strip()
 
     log.info("Received event=%s mediaType=%s issueType=%s desc=%r", event, media_type, issue_type, text)
-
+    
     # Loop prevention: ignore our own comments / bot user
     commenter = (payload.get("comment", {}) or {}).get("commentedBy_username", "") or \
                 (payload.get("comment", {}) or {}).get("commentedBy", "")
