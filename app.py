@@ -5,6 +5,7 @@ import os
 import re
 import logging
 from datetime import datetime
+from time import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -35,6 +36,11 @@ JELLYSEERR_API_KEY = os.getenv("JELLYSEERR_API_KEY", "")
 JELLYSEERR_CLOSE_ISSUES = os.getenv("JELLYSEERR_CLOSE_ISSUES", "false").lower() == "true"
 JELLYSEERR_COMMENT_ON_ACTION = os.getenv("JELLYSEERR_COMMENT_ON_ACTION", "true").lower() == "true"
 JELLYSEERR_COACH_REPORTERS = os.getenv("JELLYSEERR_COACH_REPORTERS", "true").lower() == "true"
+
+# Loop prevention
+BOT_COMMENT_PREFIX = os.getenv("JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]").strip()
+ISSUE_COOLDOWN_SEC = int(os.getenv("REMEDIARR_ISSUE_COOLDOWN_SEC", "90"))
+_recent_issue_actions: Dict[Any, float] = {}  # issue_id -> timestamp seconds
 
 # Notifications: Gotify
 GOTIFY_URL = os.getenv("GOTIFY_URL", "").rstrip("/")
@@ -345,8 +351,9 @@ async def radarr_lookup_best_tmdb(title: str, year: Optional[int]) -> Optional[i
         if year:
             for it in candidates:
                 it_year = _to_int_or_none(it.get("year")) or _to_int_or_none((it.get("releaseDate") or "")[:4])
-                if it_year and it_year == year:
+                if it_year and it == year:  # keep original behavior: prefer exact year
                     return it.get("tmdbId")
+            # if no exact year match, fall through to first candidate
         return candidates[0].get("tmdbId")
 
 
@@ -551,81 +558,80 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
     issue_type = (issue.get("issue_type") or "").lower()
 
     subject = str(payload.get("subject") or "")
+    comment_msg = str(comment.get("comment_message") or "")
+    issue_id = issue.get("issue_id")
+
     text = " ".join(
         [
             subject,
             str(issue.get("issue_type") or ""),
             str(issue.get("issue_status") or ""),
             str(payload.get("message") or ""),
-            str(comment.get("comment_message") or ""),
+            comment_msg,
         ]
     ).strip()
 
     log.info("Received event=%s mediaType=%s issueType=%s desc=%r", event, media_type, issue_type, text)
 
+    # Ignore non-issue events
     if "issue" not in event:
         return {"ok": True, "skipped": True, "reason": "non-issue event"}
+
+    # --------- Loop prevention (self-comments & cooldown) ---------
+    # 1) Ignore our own comments by prefix (covers both coaching & action comments)
+    if BOT_COMMENT_PREFIX and comment_msg.startswith(BOT_COMMENT_PREFIX):
+        log.info("Skipping: own comment prefix matched")
+        return {"ok": True, "skipped": True, "reason": "own comment prefix"}
+
+    # 2) Cooldown per issue to avoid ping-pong/retriggers
+    if issue_id:
+        last = _recent_issue_actions.get(issue_id, 0.0)
+        if (time() - last) < ISSUE_COOLDOWN_SEC:
+            log.info("Skipping: cooldown active for issue %s", issue_id)
+            return {"ok": True, "skipped": True, "reason": "cooldown active"}
 
     # ---------- COACHING & EXIT when keywords don't match ----------
     def coach_list(kw: List[str], label: str) -> str:
         return ", ".join([f"'{k}'" for k in kw[:5]]) or f"'<add {label} keywords>'"
 
+    async def _coach_and_exit(msg: str, reason: str):
+        if JELLYSEERR_COACH_REPORTERS and issue.get("issue_id"):
+            await jellyseerr_comment_issue(issue["issue_id"], f"{BOT_COMMENT_PREFIX} {msg}")
+            # Stamp cooldown after we comment
+            _recent_issue_actions[issue["issue_id"]] = time()
+        return {"ok": True, "skipped": True, "reason": reason}
+
     if JELLYSEERR_COACH_REPORTERS and issue.get("issue_id"):
         if media_type == "tv":
             if issue_type == "audio" and not _has_keyword(text, TV_AUDIO()):
-                await jellyseerr_comment_issue(
-                    issue["issue_id"],
-                    f"[Remediarr] Tip: include one of these keywords for TV audio auto-fix "
-                    f"(delete episode file + re-download): {coach_list(TV_AUDIO(), 'tv audio')}.",
-                )
-                return {"ok": True, "skipped": True, "reason": "missing tv audio keywords"}
+                msg = f"Tip: include one of these keywords for TV audio auto-fix (delete episode file + re-download): {coach_list(TV_AUDIO(), 'tv audio')}."
+                return await _coach_and_exit(msg, "missing tv audio keywords")
             if issue_type == "video" and not _has_keyword(text, TV_VIDEO()):
-                await jellyseerr_comment_issue(
-                    issue["issue_id"],
-                    f"[Remediarr] Tip: add one of: {coach_list(TV_VIDEO(), 'tv video')} to auto-fix video issues.",
-                )
-                return {"ok": True, "skipped": True, "reason": "missing tv video keywords"}
+                msg = f"Tip: add one of: {coach_list(TV_VIDEO(), 'tv video')} to auto-fix video issues."
+                return await _coach_and_exit(msg, "missing tv video keywords")
             if issue_type == "subtitle" and not _has_keyword(text, TV_SUBTITLE()):
-                await jellyseerr_comment_issue(
-                    issue["issue_id"],
-                    f"[Remediarr] Tip: add one of: {coach_list(TV_SUBTITLE(), 'tv subtitle')} to auto-fix subtitle issues.",
-                )
-                return {"ok": True, "skipped": True, "reason": "missing tv subtitle keywords"}
+                msg = f"Tip: add one of: {coach_list(TV_SUBTITLE(), 'tv subtitle')} to auto-fix subtitle issues."
+                return await _coach_and_exit(msg, "missing tv subtitle keywords")
             if issue_type == "other" and not _has_keyword(text, TV_OTHER()):
-                await jellyseerr_comment_issue(
-                    issue["issue_id"],
-                    f"[Remediarr] Tip: add one of: {coach_list(TV_OTHER(), 'tv other')} to trigger automation.",
-                )
-                return {"ok": True, "skipped": True, "reason": "missing tv other keywords"}
+                msg = f"Tip: add one of: {coach_list(TV_OTHER(), 'tv other')} to trigger automation."
+                return await _coach_and_exit(msg, "missing tv other keywords")
 
         if media_type == "movie":
             if _has_keyword(text, MOV_WRONG()):
                 pass  # handled later
             else:
                 if issue_type == "audio" and not _has_keyword(text, MOV_AUDIO()):
-                    await jellyseerr_comment_issue(
-                        issue["issue_id"],
-                        f"[Remediarr] Tip: add one of: {coach_list(MOV_AUDIO(), 'movie audio')} to auto-handle.",
-                    )
-                    return {"ok": True, "skipped": True, "reason": "missing movie audio keywords"}
+                    msg = f"Tip: add one of: {coach_list(MOV_AUDIO(), 'movie audio')} to auto-handle."
+                    return await _coach_and_exit(msg, "missing movie audio keywords")
                 if issue_type == "video" and not _has_keyword(text, MOV_VIDEO()):
-                    await jellyseerr_comment_issue(
-                        issue["issue_id"],
-                        f"[Remediarr] Tip: add one of: {coach_list(MOV_VIDEO(), 'movie video')} to auto-handle.",
-                    )
-                    return {"ok": True, "skipped": True, "reason": "missing movie video keywords"}
+                    msg = f"Tip: add one of: {coach_list(MOV_VIDEO(), 'movie video')} to auto-handle."
+                    return await _coach_and_exit(msg, "missing movie video keywords")
                 if issue_type == "subtitle" and not _has_keyword(text, MOV_SUBTITLE()):
-                    await jellyseerr_comment_issue(
-                        issue["issue_id"],
-                        f"[Remediarr] Tip: add one of: {coach_list(MOV_SUBTITLE(), 'movie subtitle')} to auto-handle.",
-                    )
-                    return {"ok": True, "skipped": True, "reason": "missing movie subtitle keywords"}
+                    msg = f"Tip: add one of: {coach_list(MOV_SUBTITLE(), 'movie subtitle')} to auto-handle."
+                    return await _coach_and_exit(msg, "missing movie subtitle keywords")
                 if issue_type == "other" and not _has_keyword(text, MOV_OTHER()):
-                    await jellyseerr_comment_issue(
-                        issue["issue_id"],
-                        f"[Remediarr] Tip: add one of: {coach_list(MOV_OTHER(), 'movie other')} to auto-handle.",
-                    )
-                    return {"ok": True, "skipped": True, "reason": "missing movie other keywords"}
+                    msg = f"Tip: add one of: {coach_list(MOV_OTHER(), 'movie other')} to auto-handle."
+                    return await _coach_and_exit(msg, "missing movie other keywords")
 
     # ---------- ACTIONS (keywords matched) ----------
     # TV
@@ -640,16 +646,18 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
             ep = await sonarr_find_episode(series_id, season, episode)
             if ep:
                 await sonarr_episode_search(ep["id"])
-            msg = f"Triggered EpisodeSearch only (TV other): {series.get('title')} S{season:02}E{episode:02}."
+            msg = f"{BOT_COMMENT_PREFIX} Triggered EpisodeSearch only (TV other): {series.get('title')} S{season:02}E{episode:02}."
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
-                await jellyseerr_comment_issue(issue["issue_id"], f"[Remediarr] {msg}")
-            await _notify("Remediarr – TV (other)", msg)
+                await jellyseerr_comment_issue(issue["issue_id"], msg)
+                _recent_issue_actions[issue["issue_id"]] = time()
+            await _notify("Remediarr – TV (other)", msg[len(BOT_COMMENT_PREFIX):].strip())
             return {"ok": True, "action": "tv_other_search_only"}
 
         deleted, ep_id = await tv_delete_and_search_episode(series_id, season, episode)
-        msg = f"{series.get('title')} S{season:02}E{episode:02} – {'deleted file and ' if deleted else ''}re-download started."
+        msg = f"{BOT_COMMENT_PREFIX} {series.get('title')} S{season:02}E{episode:02} – {'deleted file and ' if deleted else ''}re-download started."
         if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
-            await jellyseerr_comment_issue(issue["issue_id"], f"[Remediarr] {msg}")
+            await jellyseerr_comment_issue(issue["issue_id"], msg)
+            _recent_issue_actions[issue["issue_id"]] = time()
 
         closed = False
         if JELLYSEERR_CLOSE_ISSUES and issue.get("issue_id"):
@@ -657,10 +665,11 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
             if not closed:
                 await jellyseerr_comment_issue(
                     issue["issue_id"],
-                    "[Remediarr] Auto-close failed on this server variant; please close when verified.",
+                    f"{BOT_COMMENT_PREFIX} Auto-close failed on this server variant; please close when verified.",
                 )
+                _recent_issue_actions[issue["issue_id"]] = time()
 
-        await _notify("Remediarr – TV", msg + (" (closed)" if closed else ""))
+        await _notify("Remediarr – TV", msg[len(BOT_COMMENT_PREFIX):].strip() + (" (closed)" if closed else ""))
         return {"ok": True, "action": f"tv_{issue_type}", "deleted": deleted, "episodeId": ep_id, "closed": closed}
 
     # Movies
@@ -673,7 +682,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
                 do_search = await tmdb_is_digitally_released(tmdb_id)
             if do_search:
                 deleted = await radarr_fail_last_delete_and_search(movie_id)
-                msg = f"Wrong movie: {title}. Blocklisted last grab, deleted {deleted} file(s), search started."
+                human_msg = f"Wrong movie: {title}. Blocklisted last grab, deleted {deleted} file(s), search started."
             else:
                 history = await radarr_get_movie_history(movie_id)
                 grabbed = next((h for h in history if (str(h.get("eventType") or "").lower() == "grabbed")), None)
@@ -682,11 +691,12 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
                 files = await radarr_list_movie_files(movie_id)
                 for f in files:
                     await radarr_delete_movie_file(int(f["id"]))
-                msg = f"Wrong movie: {title}. Blocklisted last grab, deleted {len(files)} file(s). Not searching (not digitally released)."
+                human_msg = f"Wrong movie: {title}. Blocklisted last grab, deleted {len(files)} file(s). Not searching (not digitally released)."
 
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
-                await jellyseerr_comment_issue(issue["issue_id"], f"[Remediarr] {msg}")
-            await _notify("Remediarr – Movie", msg)
+                await jellyseerr_comment_issue(issue["issue_id"], f"{BOT_COMMENT_PREFIX} {human_msg}")
+                _recent_issue_actions[issue["issue_id"]] = time()
+            await _notify("Remediarr – Movie", human_msg)
             return {"ok": True, "action": "movie_wrong", "title": title}
 
         # otherwise respect the selected type’s keywords
@@ -699,10 +709,11 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
         if issue_type in kmap and _has_keyword(text, kmap[issue_type]):
             movie_id, title, _ = await _radarr_resolve_movie(payload)
             deleted = await radarr_fail_last_delete_and_search(movie_id)
-            msg = f"{title}: Blocklisted last grab, deleted {deleted} file(s), search started (movie {issue_type})."
+            human_msg = f"{title}: Blocklisted last grab, deleted {deleted} file(s), search started (movie {issue_type})."
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
-                await jellyseerr_comment_issue(issue["issue_id"], f"[Remediarr] {msg}")
-            await _notify("Remediarr – Movie", msg)
+                await jellyseerr_comment_issue(issue["issue_id"], f"{BOT_COMMENT_PREFIX} {human_msg}")
+                _recent_issue_actions[issue["issue_id"]] = time()
+            await _notify("Remediarr – Movie", human_msg)
             return {"ok": True, "action": f"movie_{issue_type}", "title": title}
 
     return {"ok": True, "skipped": True, "reason": "no rules matched"}
