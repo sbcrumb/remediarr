@@ -583,12 +583,40 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
         log.info("Skipping: own comment prefix matched")
         return {"ok": True, "skipped": True, "reason": "own comment prefix"}
 
-    # 2) Cooldown per issue to avoid ping-pong/retriggers
+    # 2) Cooldown per issue to avoid ping-pong/retriggers,
+    #    BUT allow through if the comment DOES contain valid keywords.
     if issue_id:
         last = _recent_issue_actions.get(issue_id, 0.0)
-        if (time() - last) < ISSUE_COOLDOWN_SEC:
+        within = (time() - last) < ISSUE_COOLDOWN_SEC
+
+        # does this comment have valid keywords for its type?
+        has_kw = False
+        if media_type == "tv":
+            if issue_type == "audio":
+                has_kw = _has_keyword(text, TV_AUDIO())
+            elif issue_type == "video":
+                has_kw = _has_keyword(text, TV_VIDEO())
+            elif issue_type == "subtitle":
+                has_kw = _has_keyword(text, TV_SUBTITLE())
+            elif issue_type == "other":
+                has_kw = _has_keyword(text, TV_OTHER())
+        elif media_type == "movie":
+            # "wrong movie" always counts as a keyword path
+            if _has_keyword(text, MOV_WRONG()):
+                has_kw = True
+            elif issue_type == "audio":
+                has_kw = _has_keyword(text, MOV_AUDIO())
+            elif issue_type == "video":
+                has_kw = _has_keyword(text, MOV_VIDEO())
+            elif issue_type == "subtitle":
+                has_kw = _has_keyword(text, MOV_SUBTITLE())
+            elif issue_type == "other":
+                has_kw = _has_keyword(text, MOV_OTHER())
+
+        if within and not has_kw:
             log.info("Skipping: cooldown active for issue %s", issue_id)
             return {"ok": True, "skipped": True, "reason": "cooldown active"}
+
 
     # ---------- COACHING & EXIT when keywords don't match ----------
     def coach_list(kw: List[str], label: str) -> str:
