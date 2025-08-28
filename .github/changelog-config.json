@@ -1,0 +1,15 @@
+{
+  "template": "# Changelog for {{currentTag}}\n\n{{#conventionalCommits}}\n- {{#scope}}**{{scope}}:** {{/scope}}{{subject}}\n{{/conventionalCommits}}\n",
+  "categories": [
+    { "title": "### 🚀 Features", "labels": ["feat", "feature"], "collapseAfter": 0 },
+    { "title": "### 🐛 Fixes", "labels": ["fix", "bug"], "collapseAfter": 0 },
+    { "title": "### 🧹 Chore", "labels": ["chore"], "collapseAfter": 0 },
+    { "title": "### 📝 Docs", "labels": ["docs"], "collapseAfter": 0 },
+    { "title": "### 🔧 Refactor", "labels": ["refactor"], "collapseAfter": 0 }
+  ],
+  "replacers": [],
+  "sort": {
+    "order": "ASC",
+    "onProperty": "scope"
+  }
+}
