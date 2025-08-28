@@ -15,7 +15,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
 
-    # Single-arch on PRs (fast), multi-arch on main/tags
+    # Single-arch on PRs (faster), multi-arch on main/tags
     env:
       PLATFORMS: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
 
@@ -65,8 +65,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            APP_VERSION=${{ env.VERSION }}
+            VERSION=${{ env.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
-
