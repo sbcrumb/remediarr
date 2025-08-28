@@ -1,3 +1,4 @@
+services:
   remediarr:
     # --- Use published image from GHCR (recommended) ---
     image: ghcr.io/sbcrumb/remediarr:latest
