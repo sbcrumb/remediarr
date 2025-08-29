@@ -33,3 +33,5 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           body: ${{ steps.build.outputs.changelog }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
