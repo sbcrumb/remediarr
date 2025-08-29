@@ -1,16 +1,13 @@
-# .github/workflows/notify-issues.yml
 name: Notify on new issues
 
 on:
   issues:
     types: [opened]
-  workflow_dispatch: {}
+  workflow_dispatch: {}  
 
 jobs:
-  gotify:
+  notify:
     runs-on: ubuntu-latest
-
-    # Expose secrets as env so we can reference them safely in step-level `if:`
     env:
       GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
       GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
@@ -19,18 +16,21 @@ jobs:
       ISSUE_TITLE: ${{ github.event.issue.title }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_URL: ${{ github.event.issue.html_url }}
-
     steps:
+      - name: Build Gotify payload
+        run: |
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
+
+          jq -n \
+            --arg title "New issue in $REPO" \
+            --arg msg "Issue #$ISSUE_NUMBER: $ISSUE_TITLE\nBy: $ACTOR\n$ISSUE_URL" \
+            --argjson priority 5 \
+            '{title:$title, message:$msg, priority:$priority}' > payload.json
+
       - name: Send Gotify notification
-        if: ${{ env.GOTIFY_URL != '' && env.GOTIFY_TOKEN != '' }}
-        shell: bash
         run: |
           set -euo pipefail
-          TITLE="New issue in ${REPO}"
-          MSG=$'Issue #'"${ISSUE_NUMBER}"$': '"${ISSUE_TITLE}"$'\nBy: '"${ACTOR}"$'\n'"${ISSUE_URL}"
-          esc() { printf '%s' "$1" | sed 's/"/\\"/g'; }
-          PAYLOAD=$(printf '{"title":"%s","message":"%s","priority":5}' "$(esc "$TITLE")" "$(esc "$MSG")")
-          curl -sS -X POST "${GOTIFY_URL%/}/message" \
-            --get --data-urlencode "token=${GOTIFY_TOKEN}" \
+          curl -sS -X POST "${GOTIFY_URL}?token=${GOTIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "${PAYLOAD}"
+            --data-binary @payload.json
