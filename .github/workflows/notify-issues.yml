@@ -1,3 +1,4 @@
+# .github/workflows/notify-issues.yml
 name: Notify on new issues
 
 on:
@@ -11,6 +12,7 @@ jobs:
     if: ${{ secrets.GOTIFY_URL != '' && secrets.GOTIFY_TOKEN != '' }}
     steps:
       - name: Send Gotify notification
+        shell: bash
         env:
           GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
           GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
@@ -22,14 +24,10 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="New issue in ${REPO}"
-          MSG="Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
-By: ${ACTOR}
-${ISSUE_URL}"
-
-          cat > payload.json <<JSON
-          { "title": "${TITLE}", "message": "${MSG}", "priority": 5 }
-JSON
-
-          curl -sS -X POST "${GOTIFY_URL%/}/message?token=${GOTIFY_TOKEN}" \
+          MSG=$'Issue #'"${ISSUE_NUMBER}"$': '"${ISSUE_TITLE}"$'\nBy: '"${ACTOR}"$'\n'"${ISSUE_URL}"
+          esc() { printf '%s' "$1" | sed 's/"/\\"/g'; }
+          PAYLOAD=$(printf '{"title":"%s","message":"%s","priority":5}' "$(esc "$TITLE")" "$(esc "$MSG")")
+          curl -sS -X POST "${GOTIFY_URL%/}/message" \
+            --get --data-urlencode "token=${GOTIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data-binary @payload.json
+            -d "${PAYLOAD}"
