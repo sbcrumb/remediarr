@@ -8,7 +8,7 @@ on:
 jobs:
   gotify:
     runs-on: ubuntu-latest
-    if: ${{ secrets.GOTIFY_URL && secrets.GOTIFY_TOKEN }}
+    if: ${{ secrets.GOTIFY_URL != '' && secrets.GOTIFY_TOKEN != '' }}
     steps:
       - name: Send Gotify notification
         env:
@@ -20,10 +20,16 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
         run: |
+          set -euo pipefail
+          TITLE="New issue in ${REPO}"
+          MSG="Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+By: ${ACTOR}
+${ISSUE_URL}"
+
+          cat > payload.json <<JSON
+          { "title": "${TITLE}", "message": "${MSG}", "priority": 5 }
+JSON
+
           curl -sS -X POST "${GOTIFY_URL%/}/message?token=${GOTIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg title "New issue in ${REPO}" \
-              --arg message "Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"$'\n'"By: ${ACTOR}"$'\n'"${ISSUE_URL}" \
-              --argjson priority 5 \
-              '{title: $title, message: $message, priority: $priority}')"
+            --data-binary @payload.json
