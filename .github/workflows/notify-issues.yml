@@ -3,64 +3,34 @@ name: Notify on new issues
 on:
   issues:
     types: [opened]
-  workflow_dispatch: {}
+  workflow_dispatch: {}  
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+    env:
+      GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+      GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+      REPO: ${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
     steps:
-      - name: Validate required secrets
+      - name: Build Gotify payload
         run: |
-          if [[ -z "${{ secrets.GOTIFY_URL }}" ]]; then
-            echo "Error: GOTIFY_URL secret is not set"
-            exit 1
-          fi
-          if [[ -z "${{ secrets.GOTIFY_TOKEN }}" ]]; then
-            echo "Error: GOTIFY_TOKEN secret is not set"
-            exit 1
-          fi
-          echo "Secrets validation passed"
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
 
-      - name: Build and send Gotify notification
-        env:
-          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
-          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+          jq -n \
+            --arg title "New issue in $REPO" \
+            --arg msg "Issue #$ISSUE_NUMBER: $ISSUE_TITLE\nBy: $ACTOR\n$ISSUE_URL" \
+            --argjson priority 5 \
+            '{title:$title, message:$msg, priority:$priority}' > payload.json
+
+      - name: Send Gotify notification
         run: |
           set -euo pipefail
-          
-          # Remove trailing slash from URL if present
-          GOTIFY_URL="${GOTIFY_URL%/}"
-          
-          # Validate URL format
-          if [[ ! "$GOTIFY_URL" =~ ^https?:// ]]; then
-            echo "Error: GOTIFY_URL must start with http:// or https://"
-            exit 1
-          fi
-          
-          # Build the notification payload
-          TITLE="New issue in ${{ github.repository }}"
-          MESSAGE="Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
-          By: ${{ github.actor }}
-          ${{ github.event.issue.html_url }}"
-          
-          # Create JSON payload
-          PAYLOAD=$(jq -n \
-            --arg title "$TITLE" \
-            --arg message "$MESSAGE" \
-            --argjson priority 5 \
-            '{title: $title, message: $message, priority: $priority}')
-          
-          echo "Sending notification to Gotify..."
-          echo "URL: ${GOTIFY_URL}/message"
-          echo "Payload: $PAYLOAD"
-          
-          # Send the notification
-          curl -X POST "${GOTIFY_URL}/message" \
+          curl -sS -X POST "${GOTIFY_URL}?token=${GOTIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            -H "X-Gotify-Key: ${GOTIFY_TOKEN}" \
-            -d "$PAYLOAD" \
-            --fail \
-            --show-error \
-            --silent
-          
-          echo "Notification sent successfully!"
+            --data-binary @payload.json
