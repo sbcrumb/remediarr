@@ -8,7 +8,7 @@ on:
 jobs:
   gotify:
     runs-on: ubuntu-latest
-    if: ${{ secrets.GOTIFY_URL != '' && secrets.GOTIFY_TOKEN != '' }}
+    if: ${{ secrets.GOTIFY_URL && secrets.GOTIFY_TOKEN }}
     steps:
       - name: Send Gotify notification
         env:
