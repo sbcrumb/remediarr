@@ -26,18 +26,18 @@ jobs:
         run: |
           SHA7="${GITHUB_SHA::7}"
           echo "SHA7=$SHA7" >> $GITHUB_ENV
-          echo "DEV_TAGS=ghcr.io/${GITHUB_REPOSITORY}:dev,ghcr.io/${GITHUB_REPOSITORY}:dev-${SHA7}" >> $GITHUB_ENV
-          echo "Computed DEV_TAGS=${{ env.DEV_TAGS }}"
+          echo "DEV_TAGS=ghcr.io/${GITHUB_REPOSITORY,,}:dev,ghcr.io/${GITHUB_REPOSITORY,,}:dev-${SHA7}" >> $GITHUB_ENV
+          echo "Computed DEV_TAGS: ghcr.io/${GITHUB_REPOSITORY,,}:dev,ghcr.io/${GITHUB_REPOSITORY,,}:dev-${SHA7}"
 
       - name: Set up QEMU
-        if: ${{ env.PLATFORMS == 'linux/amd64,linux/arm64' }}
+        if: contains(env.PLATFORMS, 'linux/arm64')
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: ${{ github.event_name != 'pull_request' }}
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -45,7 +45,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & (maybe) push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile

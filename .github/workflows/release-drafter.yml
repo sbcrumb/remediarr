@@ -1,4 +1,5 @@
 name: Release Drafter
+
 on:
   push:
     branches: [ main ]
@@ -14,7 +15,8 @@ jobs:
   update_release_draft:
     runs-on: ubuntu-latest
     steps:
-      - uses: release-drafter/release-drafter@v6
+      - name: Update release draft
+        uses: release-drafter/release-drafter@v6
         with:
           config-name: release-drafter.yml
         env:

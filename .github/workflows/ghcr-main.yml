@@ -25,16 +25,28 @@ jobs:
       - name: Read VERSION
         id: ver
         run: |
-          if [[ ! -f VERSION ]]; then echo "VERSION missing"; exit 1; fi
-          RAW=$(tr -d ' \n' < VERSION)
-          if [[ -z "$RAW" ]]; then echo "VERSION empty"; exit 1; fi
-          if [[ "$RAW" =~ ^v ]]; then TAG="$RAW"; NUM="${RAW#v}"; else TAG="v${RAW}"; NUM="$RAW"; fi
+          if [[ ! -f VERSION ]]; then
+            echo "ERROR: VERSION file is missing"
+            exit 1
+          fi
+          RAW=$(tr -d ' \n\r' < VERSION)
+          if [[ -z "$RAW" ]]; then
+            echo "ERROR: VERSION file is empty"
+            exit 1
+          fi
+          if [[ "$RAW" =~ ^v ]]; then
+            TAG="$RAW"
+            NUM="${RAW#v}"
+          else
+            TAG="v${RAW}"
+            NUM="$RAW"
+          fi
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "NUM=$NUM" >> $GITHUB_ENV
           echo "Resolved TAG=$TAG NUM=$NUM"
 
       - name: Create tag (if missing)
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/github-script@v7
         with:
           script: |
@@ -43,16 +55,19 @@ jobs:
             const { owner, repo } = context.repo;
             try {
               await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
-              core.info(`Tag ${tag} exists`);
+              core.info(`Tag ${tag} already exists`);
             } catch (e) {
               if (e.status === 404) {
                 core.info(`Creating tag ${tag} -> ${sha}`);
                 await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
-              } else { throw e; }
+              } else {
+                core.setFailed(`Error checking/creating tag: ${e.message}`);
+                throw e;
+              }
             }
 
       - name: Update draft release notes
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: drafter
         uses: release-drafter/release-drafter@v6
         with:
@@ -62,7 +77,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish GitHub Release
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
@@ -74,14 +89,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
-        if: ${{ env.PLATFORMS == 'linux/amd64,linux/arm64' }}
+        if: contains(env.PLATFORMS, 'linux/arm64')
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: ${{ github.event_name != 'pull_request' }}
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -98,7 +113,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build & Push (main)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
