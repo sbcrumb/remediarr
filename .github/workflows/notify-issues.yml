@@ -9,18 +9,21 @@ on:
 jobs:
   gotify:
     runs-on: ubuntu-latest
-    if: ${{ secrets.GOTIFY_URL != '' && secrets.GOTIFY_TOKEN != '' }}
+
+    # Expose secrets as env so we can reference them safely in step-level `if:`
+    env:
+      GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+      GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+      REPO: ${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
+
     steps:
       - name: Send Gotify notification
+        if: ${{ env.GOTIFY_URL != '' && env.GOTIFY_TOKEN != '' }}
         shell: bash
-        env:
-          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
-          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
-          REPO: ${{ github.repository }}
-          ACTOR: ${{ github.actor }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_URL: ${{ github.event.issue.html_url }}
         run: |
           set -euo pipefail
           TITLE="New issue in ${REPO}"
