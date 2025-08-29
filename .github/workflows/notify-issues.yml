@@ -1,0 +1,36 @@
+name: Notify on new issues
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch: {}  
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+      GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+      REPO: ${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
+    steps:
+      - name: Build Gotify payload
+        run: |
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
+
+          jq -n \
+            --arg title "New issue in $REPO" \
+            --arg msg "Issue #$ISSUE_NUMBER: $ISSUE_TITLE\nBy: $ACTOR\n$ISSUE_URL" \
+            --argjson priority 5 \
+            '{title:$title, message:$msg, priority:$priority}' > payload.json
+
+      - name: Send Gotify notification
+        run: |
+          set -euo pipefail
+          curl -sS -X POST "${GOTIFY_URL}?token=${GOTIFY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @payload.json
