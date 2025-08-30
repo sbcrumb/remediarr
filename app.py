@@ -8,6 +8,7 @@
 # - Startup banner + health pings to Sonarr/Radarr + notifier
 # - Gotify and/or Apprise-server notifications
 # - Cooldown to avoid loops when reacting to comments
+# - Always-on stabilization for searches: settle delay, refresh, double-search, throttling
 
 import os
 import re
@@ -75,6 +76,14 @@ GOTIFY_PRIORITY = int(os.getenv("GOTIFY_PRIORITY", "5"))
 # Apprise-server (optional): POST {title, body, type, urls:[...]} to /notify
 APPRISE_URL = os.getenv("APPRISE_URL", "").rstrip("/")
 APPRISE_TARGETS = [u.strip() for u in os.getenv("APPRISE_TARGETS", "").split(",") if u.strip()]
+
+# ---------------- Always-on stabilization ----------------
+# (Hardcoded for safety; adjust here if you ever want different defaults)
+ACTION_SETTLE_SEC = 5.0          # wait after fail/delete before first search
+RADARR_SEARCH_BACKOFF_SEC = 4.0  # wait between first and second search
+# light concurrency limits so we don't hammer services
+RADARR_SEM = asyncio.Semaphore(2)
+SONARR_SEM = asyncio.Semaphore(2)
 
 # ---------------- Keyword helpers ----------------
 def _csv_env(name: str, default: str) -> List[str]:
@@ -286,12 +295,16 @@ async def sonarr_delete_episode_file(episode_file_id: int) -> None:
         await _retry_http(_do, what=f"Sonarr delete episodefile {episode_file_id}")
 
 async def sonarr_episode_search(episode_id: int) -> None:
+    # settle + throttle
+    if ACTION_SETTLE_SEC > 0:
+        await asyncio.sleep(ACTION_SETTLE_SEC)
     payload = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
-    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
-        async def _do():
-            return await c.post(f"{SONARR_URL}/api/v3/command",
-                                params={"apikey": SONARR_API_KEY}, json=payload)
-        await _retry_http(_do, what=f"Sonarr EpisodeSearch {episode_id}")
+    async with SONARR_SEM:
+        async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+            async def _do():
+                return await c.post(f"{SONARR_URL}/api/v3/command",
+                                    params={"apikey": SONARR_API_KEY}, json=payload)
+            await _retry_http(_do, what=f"Sonarr EpisodeSearch {episode_id}")
 
 # ---------------- Radarr helpers ----------------
 async def radarr_get_movie_by_tmdb(tmdb_id: int) -> Optional[Dict[str, Any]]:
@@ -330,13 +343,47 @@ async def radarr_mark_history_failed(history_id: int) -> None:
                                 params={"apikey": RADARR_API_KEY})
         await _retry_http(_do, what=f"Radarr mark history failed {history_id}")
 
+async def radarr_refresh_movie(movie_id: int) -> None:
+    payload = {"name": "RefreshMovie", "movieIds": [movie_id]}
+    async with RADARR_SEM:
+        async with httpx.AsyncClient(timeout=RADARR_HTTP_TIMEOUT) as c:
+            async def _do():
+                return await c.post(f"{RADARR_URL}/api/v3/command",
+                                    params={"apikey": RADARR_API_KEY}, json=payload)
+            await _retry_http(_do, what=f"Radarr refresh movie {movie_id}")
+
 async def radarr_search_movie(movie_id: int) -> None:
+    # 1) Give Radarr a moment to settle if we just failed/deleted
+    if ACTION_SETTLE_SEC > 0:
+        await asyncio.sleep(ACTION_SETTLE_SEC)
+
+    # 2) Refresh first (forces a rescan/state update)
+    try:
+        await radarr_refresh_movie(movie_id)
+    except Exception as e:
+        log.warning("Radarr refresh failed for %s: %s", movie_id, e)
+
+    # 3) First search
     payload = {"name": "MoviesSearch", "movieIds": [movie_id]}
-    async with httpx.AsyncClient(timeout=RADARR_HTTP_TIMEOUT) as c:
-        async def _do():
-            return await c.post(f"{RADARR_URL}/api/v3/command",
-                                params={"apikey": RADARR_API_KEY}, json=payload)
-        await _retry_http(_do, what=f"Radarr movie search {movie_id}")
+    async with RADARR_SEM:
+        async with httpx.AsyncClient(timeout=RADARR_HTTP_TIMEOUT) as c:
+            async def _do():
+                return await c.post(f"{RADARR_URL}/api/v3/command",
+                                    params={"apikey": RADARR_API_KEY}, json=payload)
+            await _retry_http(_do, what=f"Radarr movie search {movie_id}")
+
+    # 4) Second search after a short backoff (catches racey windows)
+    if RADARR_SEARCH_BACKOFF_SEC > 0:
+        await asyncio.sleep(RADARR_SEARCH_BACKOFF_SEC)
+        try:
+            async with RADARR_SEM:
+                async with httpx.AsyncClient(timeout=RADARR_HTTP_TIMEOUT) as c:
+                    async def _do2():
+                        return await c.post(f"{RADARR_URL}/api/v3/command",
+                                            params={"apikey": RADARR_API_KEY}, json=payload)
+                    await _retry_http(_do2, what=f"Radarr movie search retry {movie_id}")
+        except Exception as e:
+            log.warning("Radarr second search failed for %s: %s", movie_id, e)
 
 # ---------------- TMDB (digital release check) ----------------
 async def tmdb_is_digitally_released(tmdb_id: int) -> bool:
@@ -546,9 +593,6 @@ async def _radarr_resolve_movie(payload: Dict[str, Any]) -> Tuple[int, str, Opti
         title, year = _extract_title_year_from_text(subj, msg, cmsg)
         if not title:
             raise HTTPException(status_code=400, detail="Missing tmdbId and could not infer title/year")
-        # Best-effort: try Radarr lookup (via /movie?tmdbId won’t work without id, so assume Radarr already has it)
-        # If Radarr does not have it, this will fail 404 later.
-        # In prior iterations, a Radarr /movie/lookup pass could be added; keeping simple here.
         raise HTTPException(status_code=400, detail=f"Missing tmdbId for '{title}'. Please include it in webhook.")
     movie = await radarr_get_movie_by_tmdb(int(tmdb_id))
     if not movie:
@@ -679,20 +723,22 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
             log.info("TV action aborted: %s", e.detail)
             return {"ok": True, "skipped": True, "reason": e.detail}
 
-        # "other" = search only
-        if issue_type == "other":
+        # Subtitles and "other" are search-only
+        if issue_type in ("subtitle", "other"):
             ep = await sonarr_find_episode(series_id, season, episode)
             if ep:
                 await sonarr_episode_search(ep["id"])
-            msg = MSG_TV_OTHER_SEARCH_ONLY.format(title=series.get("title", "TV Show"),
-                                                  season=season, episode=episode)
+            msg = (MSG_TV_OTHER_SEARCH_ONLY if issue_type == "other" else MSG_TV_EP_SEARCH_ONLY).format(
+                title=series.get("title", "TV Show"), season=season, episode=episode
+            )
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
                 await jellyseerr_comment_issue(issue["issue_id"], msg)
-            await _notify("Remediarr – TV (other)", msg)
+            await _notify("Remediarr – TV", msg)
             if issue_id:
                 _last_action_at[issue_id] = now_ts
-            return {"ok": True, "action": "tv_other_search_only"}
+            return {"ok": True, "action": f"tv_{issue_type}_search_only"}
 
+        # audio/video -> delete + search
         deleted, ep_id = await tv_delete_and_search_episode(series_id, season, episode)
         msg = MSG_TV_EP_REPLACED.format(title=series.get("title", "TV Show"),
                                         season=season, episode=episode)
@@ -768,7 +814,12 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
         }
         if issue_type in kmap and _has_keyword(text, kmap[issue_type]):
             movie_id, title, _ = await _radarr_resolve_movie(payload)
-            deleted = await radarr_fail_last_delete_and_search(movie_id)
+            if issue_type == "subtitle" or issue_type == "other":
+                # search only
+                await radarr_search_movie(movie_id)
+                deleted = 0
+            else:
+                deleted = await radarr_fail_last_delete_and_search(movie_id)
             msg = MSG_MOV_GENERIC_HANDLED.format(title=title, deleted=deleted)
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
                 await jellyseerr_comment_issue(issue["issue_id"], msg)
