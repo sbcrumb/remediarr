@@ -1,4 +1,4 @@
-[![Build & Publish to GHCR](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr.yml/badge.svg)](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr.yml)
+[![Build & Publish to GHCR](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr.yml/badge.svg)](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr-dev.yml)
 [![Container image](https://img.shields.io/badge/GHCR-ghcr.io%2Fsbcrumb%2Fremediarr-blue)](https://github.com/sbcrumb/remediarr/pkgs/container/remediarr)
 
 # Remediarr
