@@ -7,8 +7,8 @@
 # - Optional issue auto-close (best-effort; works on servers exposing /issue/{id}/resolved)
 # - Startup banner + health pings to Sonarr/Radarr + notifier
 # - Gotify and/or Apprise-server notifications
-# - Cooldown to avoid loops when reacting to comments
-# - Always-on stabilization for searches: settle delay, refresh, double-search, throttling
+# - Cooldown to avoid loops when reacting to comments (ignored when a valid keyword is present)
+# - Radarr stabilization: refresh + RSS sync + settle + double-search
 
 import os
 import re
@@ -78,12 +78,13 @@ APPRISE_URL = os.getenv("APPRISE_URL", "").rstrip("/")
 APPRISE_TARGETS = [u.strip() for u in os.getenv("APPRISE_TARGETS", "").split(",") if u.strip()]
 
 # ---------------- Always-on stabilization ----------------
-# (Hardcoded for safety; adjust here if you ever want different defaults)
-ACTION_SETTLE_SEC = 5.0          # wait after fail/delete before first search
-RADARR_SEARCH_BACKOFF_SEC = 4.0  # wait between first and second search
-# light concurrency limits so we don't hammer services
-RADARR_SEM = asyncio.Semaphore(2)
-SONARR_SEM = asyncio.Semaphore(2)
+ACTION_SETTLE_SEC = float(os.getenv("ACTION_SETTLE_SEC", "8"))                # wait after delete/fail before first search
+RADARR_SEARCH_BACKOFF_SEC = float(os.getenv("RADARR_SEARCH_BACKOFF_SEC", "6"))  # wait between first & second search
+RADARR_RSS_SYNC_BEFORE_SEARCH = os.getenv("RADARR_RSS_SYNC_BEFORE_SEARCH", "true").lower() == "true"
+RADARR_CONCURRENCY = int(os.getenv("RADARR_CONCURRENCY", "2"))
+SONARR_CONCURRENCY = int(os.getenv("SONARR_CONCURRENCY", "2"))
+RADARR_SEM = asyncio.Semaphore(RADARR_CONCURRENCY)
+SONARR_SEM = asyncio.Semaphore(SONARR_CONCURRENCY)
 
 # ---------------- Keyword helpers ----------------
 def _csv_env(name: str, default: str) -> List[str]:
@@ -295,7 +296,7 @@ async def sonarr_delete_episode_file(episode_file_id: int) -> None:
         await _retry_http(_do, what=f"Sonarr delete episodefile {episode_file_id}")
 
 async def sonarr_episode_search(episode_id: int) -> None:
-    # settle + throttle
+    # small settle to avoid “search before wanted state” races
     if ACTION_SETTLE_SEC > 0:
         await asyncio.sleep(ACTION_SETTLE_SEC)
     payload = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
@@ -352,16 +353,32 @@ async def radarr_refresh_movie(movie_id: int) -> None:
                                     params={"apikey": RADARR_API_KEY}, json=payload)
             await _retry_http(_do, what=f"Radarr refresh movie {movie_id}")
 
+async def radarr_rss_sync() -> None:
+    if not RADARR_RSS_SYNC_BEFORE_SEARCH:
+        return
+    payload = {"name": "RssSync"}
+    async with RADARR_SEM:
+        async with httpx.AsyncClient(timeout=RADARR_HTTP_TIMEOUT) as c:
+            async def _do():
+                return await c.post(f"{RADARR_URL}/api/v3/command",
+                                    params={"apikey": RADARR_API_KEY}, json=payload)
+            await _retry_http(_do, what="Radarr RSS sync")
+
 async def radarr_search_movie(movie_id: int) -> None:
-    # 1) Give Radarr a moment to settle if we just failed/deleted
+    # 1) Allow Radarr to settle
     if ACTION_SETTLE_SEC > 0:
         await asyncio.sleep(ACTION_SETTLE_SEC)
 
-    # 2) Refresh first (forces a rescan/state update)
+    # 2) Refresh & RSS sync (brings in fresh indexer data)
     try:
         await radarr_refresh_movie(movie_id)
     except Exception as e:
         log.warning("Radarr refresh failed for %s: %s", movie_id, e)
+
+    try:
+        await radarr_rss_sync()
+    except Exception as e:
+        log.warning("Radarr RSS sync failed: %s", e)
 
     # 3) First search
     payload = {"name": "MoviesSearch", "movieIds": [movie_id]}
@@ -372,7 +389,7 @@ async def radarr_search_movie(movie_id: int) -> None:
                                     params={"apikey": RADARR_API_KEY}, json=payload)
             await _retry_http(_do, what=f"Radarr movie search {movie_id}")
 
-    # 4) Second search after a short backoff (catches racey windows)
+    # 4) Second search after short backoff (catches race windows)
     if RADARR_SEARCH_BACKOFF_SEC > 0:
         await asyncio.sleep(RADARR_SEARCH_BACKOFF_SEC)
         try:
@@ -438,7 +455,7 @@ async def jellyseerr_close_issue(issue_id: Any) -> bool:
         return False
     attempts = [
         ("POST", f"/api/v1/issue/{issue_id}/resolved", None, None),
-        # legacy/variants we’ve seen (likely to 400/404, but harmless to try):
+        # legacy/variants we’ve seen (harmless to try):
         ("POST", f"/api/v1/issue/{issue_id}/resolve", None, {"status": "resolved"}),
         ("POST", f"/api/v1/issue/{issue_id}/status", {"status": "resolved"}, None),
     ]
@@ -617,6 +634,7 @@ async def radarr_fail_last_delete_and_search(movie_id: int) -> int:
             deleted += 1
         except Exception as e:
             log.warning("Delete timeout/failed for moviefile %s (movie %s): %s", mfid, movie_id, e)
+
     try:
         await radarr_search_movie(movie_id)
     except Exception as e:
@@ -651,7 +669,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
 
     log.info("Received event=%s mediaType=%s issueType=%s desc=%r", event, media_type, issue_type, text)
 
-    # Loop prevention: ignore our own comments and bot user
+    # Loop prevention: ignore our own comments / bot user
     commenter = (payload.get("comment", {}) or {}).get("commentedBy_username", "") or \
                 (payload.get("comment", {}) or {}).get("commentedBy", "")
     if OWN_COMMENT_PREFIX and OWN_COMMENT_PREFIX.lower() in text.lower():
@@ -661,14 +679,42 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
         log.info("Skipping: bot user comment matched: %s", commenter)
         return {"ok": True, "skipped": True, "reason": "bot user comment"}
 
-    # Cooldown: apply only to comment-driven actions to avoid ping-pong
     issue_id = str(issue.get("issue_id") or "")
     now_ts = datetime.utcnow().timestamp()
+
+    # Determine if this comment includes an action keyword (so we can BYPASS cooldown)
+    def _has_action_keyword() -> bool:
+        if media_type == "tv":
+            m = {
+                "audio": TV_AUDIO(),
+                "video": TV_VIDEO(),
+                "subtitle": TV_SUBTITLE(),
+                "other": TV_OTHER(),
+            }
+            if issue_type in m and _has_keyword(text, m[issue_type]):
+                return True
+            return False
+        if media_type == "movie":
+            if _has_keyword(text, MOV_WRONG()):
+                return True
+            m = {
+                "audio": MOV_AUDIO(),
+                "video": MOV_VIDEO(),
+                "subtitle": MOV_SUBTITLE(),
+                "other": MOV_OTHER(),
+            }
+            if issue_type in m and _has_keyword(text, m[issue_type]):
+                return True
+            return False
+        return False
+
+    # Cooldown only for comments without action keywords (prevents ping-pong)
     if "comment" in event and issue_id:
-        last = _last_action_at.get(issue_id, 0.0)
-        if now_ts - last < COOLDOWN_SEC:
-            log.info("Skipping: cooldown active for issue %s", issue_id)
-            return {"ok": True, "skipped": True, "reason": f"cooldown {COOLDOWN_SEC}s"}
+        if not _has_action_keyword():
+            last = _last_action_at.get(issue_id, 0.0)
+            if now_ts - last < COOLDOWN_SEC:
+                log.info("Skipping: cooldown active for issue %s", issue_id)
+                return {"ok": True, "skipped": True, "reason": f"cooldown {COOLDOWN_SEC}s"}
 
     # ---------- Coaching when keywords don't match ----------
     def coach_list(kw: List[str], label: str) -> str:
@@ -723,7 +769,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
             log.info("TV action aborted: %s", e.detail)
             return {"ok": True, "skipped": True, "reason": e.detail}
 
-        # Subtitles and "other" are search-only
+        # SUBTITLE and OTHER => search-only (no delete)
         if issue_type in ("subtitle", "other"):
             ep = await sonarr_find_episode(series_id, season, episode)
             if ep:
@@ -733,22 +779,20 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
             )
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
                 await jellyseerr_comment_issue(issue["issue_id"], msg)
-            await _notify("Remediarr – TV", msg)
+            await _notify("Remediarr – TV (search-only)", msg)
             if issue_id:
                 _last_action_at[issue_id] = now_ts
             return {"ok": True, "action": f"tv_{issue_type}_search_only"}
 
-        # audio/video -> delete + search
+        # audio/video => delete file (if present) + search
         deleted, ep_id = await tv_delete_and_search_episode(series_id, season, episode)
-        msg = MSG_TV_EP_REPLACED.format(title=series.get("title", "TV Show"),
-                                        season=season, episode=episode)
+        msg = MSG_TV_EP_REPLACED.format(title=series.get("title", "TV Show"), season=season, episode=episode)
         if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
             await jellyseerr_comment_issue(issue["issue_id"], msg)
 
         closed = False
         if JELLYSEERR_CLOSE_ISSUES and issue.get("issue_id"):
             closed = await jellyseerr_close_issue(issue["issue_id"])
-            # Optional close message
             if closed and JELLYSEERR_CLOSE_MESSAGE:
                 await jellyseerr_comment_issue(issue["issue_id"], JELLYSEERR_CLOSE_MESSAGE)
             if not closed:
@@ -761,7 +805,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
 
     # Movies
     if media_type == "movie":
-        # wrong movie path
+        # wrong movie path (may skip search if not digitally released)
         if _has_keyword(text, MOV_WRONG()):
             movie_id, title, tmdb_id = await _radarr_resolve_movie(payload)
             do_search = True
@@ -783,8 +827,7 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
                 deleted = 0
                 for f in files:
                     try:
-                        await radarr_delete_movie_file(int(f["id"]))
-                        deleted += 1
+                        await radarr_delete_movie_file(int(f["id"])); deleted += 1
                     except Exception as e:
                         log.warning("Delete timeout/failed for moviefile %s (movie %s): %s", f.get("id"), movie_id, e)
                 msg = MSG_MOV_WRONG_NO_RELEASE.format(title=title, deleted=deleted)
@@ -805,21 +848,39 @@ async def jellyseerr_webhook(request: Request, x_jellyseerr_signature: Optional[
                 _last_action_at[issue_id] = now_ts
             return {"ok": True, "action": "movie_wrong", "title": title, "closed": closed}
 
-        # standard movie types (audio/video/subtitle/other)
+        # standard movie types
         kmap = {
             "audio": MOV_AUDIO(),
             "video": MOV_VIDEO(),
             "subtitle": MOV_SUBTITLE(),
             "other": MOV_OTHER(),
         }
-        if issue_type in kmap and _has_keyword(text, kmap[issue_type]):
+
+        # SUBTITLE/OTHER => search only (no delete)
+        if issue_type in ("subtitle", "other") and _has_keyword(text, kmap.get(issue_type, [])):
             movie_id, title, _ = await _radarr_resolve_movie(payload)
-            if issue_type == "subtitle" or issue_type == "other":
-                # search only
-                await radarr_search_movie(movie_id)
-                deleted = 0
-            else:
-                deleted = await radarr_fail_last_delete_and_search(movie_id)
+            await radarr_search_movie(movie_id)
+            msg = MSG_MOV_GENERIC_HANDLED.format(title=title, deleted=0).replace("deleted 0 file(s), ", "")
+            if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
+                await jellyseerr_comment_issue(issue["issue_id"], msg)
+
+            closed = False
+            if JELLYSEERR_CLOSE_ISSUES and issue.get("issue_id"):
+                closed = await jellyseerr_close_issue(issue["issue_id"])
+                if closed and JELLYSEERR_CLOSE_MESSAGE:
+                    await jellyseerr_comment_issue(issue["issue_id"], JELLYSEERR_CLOSE_MESSAGE)
+                if not closed:
+                    await jellyseerr_comment_issue(issue["issue_id"], MSG_AUTOCLOSE_FAIL)
+
+            await _notify("Remediarr – Movie (search-only)", msg + (" (closed)" if closed else ""))
+            if issue_id:
+                _last_action_at[issue_id] = now_ts
+            return {"ok": True, "action": f"movie_{issue_type}_search_only", "title": title, "closed": closed}
+
+        # AUDIO/VIDEO with keywords => fail+delete+search
+        if issue_type in ("audio", "video") and _has_keyword(text, kmap.get(issue_type, [])):
+            movie_id, title, _ = await _radarr_resolve_movie(payload)
+            deleted = await radarr_fail_last_delete_and_search(movie_id)
             msg = MSG_MOV_GENERIC_HANDLED.format(title=title, deleted=deleted)
             if JELLYSEERR_COMMENT_ON_ACTION and issue.get("issue_id"):
                 await jellyseerr_comment_issue(issue["issue_id"], msg)
