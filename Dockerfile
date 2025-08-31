@@ -1,23 +1,29 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.11-slim
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+FROM python:3.11-slim AS base
+
+# Build-time version (fed by GH Actions: build-args: APP_VERSION=...)
+ARG APP_VERSION=0.0.0-dev
+ENV APP_VERSION=${APP_VERSION}
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Accept a build-time version (fallback to file copy)
-ARG VERSION=0.0.0-dev
-ENV APP_VERSION=${VERSION}
-
-# Install deps with BuildKit cache
+# 1) Install deps first (better cache)
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt
 
-# App code
-COPY app.py /app/app.py
+# 2) Copy source
+COPY app ./app
+COPY VERSION ./VERSION
 
-# Also copy the plaintext VERSION file (for local runs / safety)
-COPY VERSION /app/VERSION
+ RUN useradd -m -u 1000 appuser
+ USER appuser
 
+# Expose (doc only)
 EXPOSE 8189
+
+# Run the FastAPI app from the package entry
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8189"]
