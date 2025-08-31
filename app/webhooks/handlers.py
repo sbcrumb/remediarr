@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from app.config import cfg, BOT_PREFIX
 from app.logging import log
-from app.services.jellyseerr import jelly_comment, jelly_close, is_our_comment
+from app.services.jellyseerr import jelly_comment, jelly_close, is_our_comment, jelly_fetch_issue
 from app.services import sonarr as S
 from app.services import radarr as R
 
@@ -67,7 +67,6 @@ def _extract_media(payload: Dict[str, Any]) -> Tuple[str, Optional[int], Optiona
     else:
         media_type = "series" if tvdb else "movie"
 
-    # best-effort season/episode from common fields
     season = _pick_int(
         media_d.get("seasonNumber") or issue.get("season") or payload.get("season") or comment.get("season")
     )
@@ -121,6 +120,25 @@ async def _poll_until(predicate_coro, timeout_sec: int, interval_sec: int) -> bo
     return False
 
 
+async def _already_posted_same(issue_id: Optional[int], intended_msg_prefixed: str) -> bool:
+    """Best-effort de-dupe: if our last comment equals intended message, skip."""
+    if not issue_id:
+        return False
+    try:
+        issue = await jelly_fetch_issue(issue_id)
+        if not isinstance(issue, dict):
+            return False
+        comments = issue.get("comments") or issue.get("activity") or []
+        # comments may be newest-last or newest-first; just scan a few
+        for c in (list(comments)[-5:] if isinstance(comments, list) else []):
+            text = (c.get("message") or c.get("text") or "").strip()
+            if text and text.strip() == intended_msg_prefixed.strip():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 # ---------- remediation flows ----------
 
 async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Optional[str], title: Optional[str],
@@ -144,11 +162,13 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
 
     series_id = int(series["id"])
 
-    # No keywords? Coach and exit.
+    # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
-            coach = cfg.MSG_KEYWORD_COACH or "Tip: include an auto-fix keyword next time so I can repair this automatically."
-            await jelly_comment(issue_id, _ensure_prefixed(coach))
+            coach = cfg.MSG_KEYWORD_COACH or "Tip: include one of the auto-fix keywords next time so I can repair this automatically."
+            coach_pref = _ensure_prefixed(coach)
+            if not await _already_posted_same(issue_id, coach_pref):
+                await jelly_comment(issue_id, coach_pref)
         return {"found": True, "acted": False, "seriesId": series_id}
 
     # Delete episode file(s)
@@ -167,13 +187,12 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
     ok = await _poll_until(grabbed_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) or \
          await _poll_until(queue_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
 
-    # Success comment (prefer specific message if provided)
+    # Success comment
     if ok and issue_id:
         if season is not None and episode is not None:
             msg = cfg.MSG_TV_REPLACED_AND_GRABBED or "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue."
             msg = msg.format(title=title or series.get("title") or "Unknown", season=season or 0, episode=episode or 0)
         else:
-            # series-wide
             msg = cfg.MSG_TV_SEARCH_ONLY_GRABBED or "{title}: new downloads are being grabbed. Closing this issue."
             msg = msg.format(title=title or series.get("title") or "Unknown", season=0, episode=0)
         await jelly_comment(issue_id, _ensure_prefixed(msg))
@@ -207,13 +226,16 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
 
     movie_id = int(movie["id"])
 
+    # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
-            coach = cfg.MSG_KEYWORD_COACH or "Tip: include an auto-fix keyword next time so I can repair this automatically."
-            await jelly_comment(issue_id, _ensure_prefixed(coach))
+            coach = cfg.MSG_KEYWORD_COACH or "Tip: include one of the auto-fix keywords next time so I can repair this automatically."
+            coach_pref = _ensure_prefixed(coach)
+            if not await _already_posted_same(issue_id, coach_pref):
+                await jelly_comment(issue_id, coach_pref)
         return {"found": True, "acted": False, "movieId": movie_id}
 
-    # Delete movie files (but keep the movie entry)
+    # Delete movie files (keep library entry)
     deleted = await R.delete_moviefiles(movie_id)
 
     if issue_id:
@@ -248,6 +270,12 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # We ignore our own comments regardless of the event name/string.
+    comment = payload.get("comment") or {}
+    comment_text = (comment.get("text") or comment.get("message") or "").strip()
+    if comment_text and is_our_comment(comment_text):
+        return {"ok": True, "ignored": "own_comment"}
+
     event = (payload.get("event") or "").lower()
     issue = payload.get("issue") or {}
     issue_id = _pick_int(issue.get("issue_id") or issue.get("id"))
@@ -258,18 +286,12 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     log.info(
         "Webhook event=%s issue_id=%s media_type=%s tmdb=%s tvdb=%s imdb=%s title=%s year=%s season=%s episode=%s bucket=%s",
-        event, issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
+        event or "unknown", issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
     )
 
-    # Don’t reply to our own comments
-    if event == "comment.created":
-        c = payload.get("comment") or {}
-        msg = (c.get("text") or c.get("message") or "").strip()
-        if msg and is_our_comment(msg):
-            return {"ok": True, "ignored": "own_comment"}
-
-        if cfg.ACK_ON_COMMENT_CREATED and issue_id:
-            await jelly_comment(issue_id, _ensure_prefixed("Thanks! Running automated remediation…"))
+    # Optional human ack on user comments (but only if it's not ours)
+    if event.find("comment") != -1 and comment_text and not is_our_comment(comment_text) and cfg.ACK_ON_COMMENT_CREATED and issue_id:
+        await jelly_comment(issue_id, _ensure_prefixed("Thanks! Running automated remediation…"))
 
     # Act based on media type
     if media_type == "series":
