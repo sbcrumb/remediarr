@@ -95,12 +95,7 @@ def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
 
 
 def _keyword_buckets_for_media(media_type: str) -> "OrderedDict[str, list[str]]":
-    """
-    Return keywords grouped by semantic bucket for the given media type.
-    Order is preserved for nice display.
-    """
     from collections import OrderedDict as OD
-
     if media_type == "series":
         buckets = OD()
         buckets["audio"] = _split_keywords(cfg.TV_AUDIO_KEYWORDS)
@@ -114,17 +109,12 @@ def _keyword_buckets_for_media(media_type: str) -> "OrderedDict[str, list[str]]"
         buckets["subtitle"] = _split_keywords(cfg.MOVIE_SUBTITLE_KEYWORDS)
         buckets["wrong"] = _split_keywords(cfg.MOVIE_WRONG_KEYWORDS)
         buckets["other"] = _split_keywords(cfg.MOVIE_OTHER_KEYWORDS)
-    # de-dupe within each
     for k in list(buckets.keys()):
         buckets[k] = _dedupe_preserve_order(buckets[k])
     return buckets
 
 
 def _keywords_text_grouped(media_type: str) -> str:
-    """
-    Render grouped keywords like:
-      "audio: no audio, no sound | video: no video, black screen | subtitle: missing subs"
-    """
     buckets = _keyword_buckets_for_media(media_type)
     parts = []
     for name, kws in buckets.items():
@@ -138,7 +128,9 @@ def _match_bucket(media_type: str, text: str) -> Optional[str]:
     Return a logical bucket name if any keyword matches, else None.
     Buckets: audio, video, subtitle, wrong (movies only), other
     """
-    t = text.lower()
+    t = (text or "").lower()
+    if not t:
+        return None
     if media_type == "series":
         if any(kw in t for kw in _split_keywords(cfg.TV_AUDIO_KEYWORDS)): return "audio"
         if any(kw in t for kw in _split_keywords(cfg.TV_VIDEO_KEYWORDS)): return "video"
@@ -150,6 +142,20 @@ def _match_bucket(media_type: str, text: str) -> Optional[str]:
         if any(kw in t for kw in _split_keywords(cfg.MOVIE_SUBTITLE_KEYWORDS)): return "subtitle"
         if any(kw in t for kw in _split_keywords(cfg.MOVIE_WRONG_KEYWORDS)): return "wrong"
         if any(kw in t for kw in _split_keywords(cfg.MOVIE_OTHER_KEYWORDS)): return "other"
+    return None
+
+
+def _latest_human_comment_text(issue_json: Dict[str, Any] | None) -> Optional[str]:
+    """Return the most recent non-bot comment text from the issue JSON."""
+    if not issue_json:
+        return None
+    comments = issue_json.get("comments") or issue_json.get("activity") or []
+    if not isinstance(comments, list):
+        return None
+    for c in reversed(comments):
+        txt = (c.get("message") or c.get("text") or "").strip()
+        if txt and not is_our_comment(txt):
+            return txt
     return None
 
 
@@ -185,7 +191,6 @@ async def _already_posted_same(issue_id: Optional[int], intended_msg_prefixed: s
 
 async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Optional[str], title: Optional[str],
                          year: Optional[int], season: Optional[int], episode: Optional[int], bucket: Optional[str]) -> Dict[str, Any]:
-    # Resolve series
     series = None
     if tvdb:
         series = await S.get_series_by_tvdb(tvdb)
@@ -207,7 +212,6 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
     series_id = int(series["id"])
     kws_text = _keywords_text_grouped("series")
 
-    # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
             template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
@@ -223,7 +227,6 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                 await jelly_comment(issue_id, coach_pref, force_prefix=False)
         return {"found": True, "acted": False, "seriesId": series_id}
 
-    # Delete episode file(s)
     ep_ids = await S.find_episode_ids(series_id, season, episode)
     deleted = await S.delete_episodefiles_by_episode_ids(ep_ids)
     if issue_id:
@@ -231,14 +234,12 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
         log.info("Outgoing comment: %r", msg)
         await jelly_comment(issue_id, msg, force_prefix=False)
 
-    # Trigger search + verify
     await S.search_series(series_id)
     grabbed_pred = lambda: S.history_has_recent_grab(series_id, cfg.SONARR_VERIFY_GRAB_SEC)
     queue_pred = lambda: S.queue_has_series(series_id)
     ok = await _poll_until(grabbed_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) or \
          await _poll_until(queue_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
 
-    # Success comment
     if ok and issue_id:
         if season is not None and episode is not None:
             msg = (cfg.MSG_TV_REPLACED_AND_GRABBED or
@@ -265,7 +266,6 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "seriesId": series_id, "queued": True}
 
-    # Couldn’t verify
     if issue_id:
         fail = (cfg.MSG_AUTOCLOSE_FAIL or
                 "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
@@ -282,7 +282,6 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
 
 async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Optional[str], title: Optional[str],
                         year: Optional[int], bucket: Optional[str]) -> Dict[str, Any]:
-    # Resolve movie
     movie = None
     if tmdb:
         movie = await R.get_movie_by_tmdb(tmdb)
@@ -302,7 +301,6 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
     movie_id = int(movie["id"])
     kws_text = _keywords_text_grouped("movie")
 
-    # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
             template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
@@ -318,14 +316,12 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
                 await jelly_comment(issue_id, coach_pref, force_prefix=False)
         return {"found": True, "acted": False, "movieId": movie_id}
 
-    # Delete movie files (keep library entry)
     deleted = await R.delete_moviefiles(movie_id)
     if issue_id:
         msg = _ensure_prefixed(f"Queued replacement: removed {deleted} movie file(s). Triggering search…")
         log.info("Outgoing comment: %r", msg)
         await jelly_comment(issue_id, msg, force_prefix=False)
 
-    # Trigger search + verify
     await R.search_movie(movie_id)
     grabbed_pred = lambda: R.history_has_recent_grab(movie_id, cfg.RADARR_VERIFY_GRAB_SEC)
     queue_pred = lambda: R.queue_has_movie(movie_id)
@@ -372,7 +368,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     comment = payload.get("comment") or {}
     comment_text = (comment.get("text") or comment.get("message") or "").strip()
     if comment_text:
-        log.info("Inbound comment text: %r", comment_text.replace("\n", " ")[:300])
+        log.info("Inbound comment text (payload): %r", comment_text.replace("\n", " ")[:300])
         if is_our_comment(comment_text):
             log.info("Ignoring own comment.")
             return {"ok": True, "ignored": "own_comment"}
@@ -385,10 +381,24 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = _gather_text_for_keywords(payload)
     bucket = _match_bucket(media_type, text)
 
+    # Fallback: if no payload comment or no bucket match, fetch the issue and scan the latest human comment
+    if (not comment_text or not text) or bucket is None:
+        issue_json = await jelly_fetch_issue(issue_id) if issue_id else None
+        last_human = _latest_human_comment_text(issue_json)
+        if last_human:
+            combined = (text + " " + last_human).strip() if text else last_human
+            bucket2 = _match_bucket(media_type, combined)
+            log.info("Keyword scan (fallback last human comment): %r -> bucket=%s", last_human[:200], bucket2)
+            if bucket2:
+                text = combined
+                bucket = bucket2
+
     log.info(
         "Webhook event=%s issue_id=%s media_type=%s tmdb=%s tvdb=%s imdb=%s title=%s year=%s season=%s episode=%s bucket=%s",
         event or "unknown", issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
     )
+    if text:
+        log.debug("Keyword scan text preview: %r", text[:300])
 
     # Optional ack on user comments (not ours)
     if event.find("comment") != -1 and comment_text and not is_our_comment(comment_text) and cfg.ACK_ON_COMMENT_CREATED and issue_id:
