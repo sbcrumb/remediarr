@@ -37,12 +37,16 @@ def is_our_comment(text: Optional[str]) -> bool:
 
 async def jelly_comment(issue_id: Any, message: str, *, force_prefix: bool = True) -> bool:
     """
-    Post a comment to a Jellyseerr issue. We try both v1 paths for compatibility.
+    Post a comment to a Jellyseerr issue. Tries two endpoints for compatibility.
+    Also logs the outgoing comment content.
     """
     if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
         return False
 
     payload_msg = _with_prefix(message) if force_prefix else (message or "")
+    preview = payload_msg.replace("\n", " ")[:300]
+    log.info("Jellyseerr: posting comment to issue %s: %r", issue_id, preview)
+
     paths = [
         f"/api/v1/issue/{issue_id}/comment",
         f"/api/v1/issues/{issue_id}/comments",
@@ -105,7 +109,14 @@ async def jelly_fetch_issue(issue_id: Any) -> Optional[Dict[str, Any]]:
                 if r.status_code == 404:
                     continue
                 r.raise_for_status()
-                return r.json()
+                data = r.json()
+                # Best-effort debug preview of the last comment
+                comments = data.get("comments") or data.get("activity") or []
+                if isinstance(comments, list) and comments:
+                    last = comments[-1]
+                    txt = (last.get("message") or last.get("text") or "").replace("\n", " ")[:300]
+                    log.info("Jellyseerr: last comment on issue %s: %r", issue_id, txt)
+                return data
             except httpx.HTTPStatusError as e:
                 if e.response is not None and e.response.status_code == 404:
                     continue

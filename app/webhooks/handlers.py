@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional, Tuple, Iterable
+from typing import Any, Dict, Optional, Tuple, Iterable, OrderedDict
 
 from fastapi import HTTPException
 
@@ -36,7 +36,6 @@ def _pick_int(x: Any) -> Optional[int]:
 def _extract_media(payload: Dict[str, Any]) -> Tuple[str, Optional[int], Optional[int], Optional[str], Optional[str], Optional[int], Optional[int], Optional[int]]:
     """
     Return (media_type, tmdbId, tvdbId, imdbId, title, year, season, episode)
-    Season/Episode best-effort: if not present, None.
     """
     media = payload.get("media") or {}
     issue = payload.get("issue") or {}
@@ -67,12 +66,8 @@ def _extract_media(payload: Dict[str, Any]) -> Tuple[str, Optional[int], Optiona
     else:
         media_type = "series" if tvdb else "movie"
 
-    season = _pick_int(
-        media_d.get("seasonNumber") or issue.get("season") or payload.get("season") or comment.get("season")
-    )
-    episode = _pick_int(
-        media_d.get("episodeNumber") or issue.get("episode") or payload.get("episode") or comment.get("episode")
-    )
+    season = _pick_int(media_d.get("seasonNumber") or issue.get("season") or payload.get("season") or comment.get("season"))
+    episode = _pick_int(media_d.get("episodeNumber") or issue.get("episode") or payload.get("episode") or comment.get("episode"))
 
     return media_type, tmdb, tvdb, imdb, title, year, season, episode
 
@@ -99,25 +94,43 @@ def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
     return out
 
 
-def _keywords_for_media(media_type: str) -> list[str]:
-    """Return the configured keyword list for the given media type, de-duplicated, order-preserving."""
+def _keyword_buckets_for_media(media_type: str) -> "OrderedDict[str, list[str]]":
+    """
+    Return keywords grouped by semantic bucket for the given media type.
+    Order is preserved for nice display.
+    """
+    from collections import OrderedDict as OD
+
     if media_type == "series":
-        buckets = [
-            _split_keywords(cfg.TV_AUDIO_KEYWORDS),
-            _split_keywords(cfg.TV_VIDEO_KEYWORDS),
-            _split_keywords(cfg.TV_SUBTITLE_KEYWORDS),
-            _split_keywords(cfg.TV_OTHER_KEYWORDS),
-        ]
+        buckets = OD()
+        buckets["audio"] = _split_keywords(cfg.TV_AUDIO_KEYWORDS)
+        buckets["video"] = _split_keywords(cfg.TV_VIDEO_KEYWORDS)
+        buckets["subtitle"] = _split_keywords(cfg.TV_SUBTITLE_KEYWORDS)
+        buckets["other"] = _split_keywords(cfg.TV_OTHER_KEYWORDS)
     else:
-        buckets = [
-            _split_keywords(cfg.MOVIE_AUDIO_KEYWORDS),
-            _split_keywords(cfg.MOVIE_VIDEO_KEYWORDS),
-            _split_keywords(cfg.MOVIE_SUBTITLE_KEYWORDS),
-            _split_keywords(cfg.MOVIE_WRONG_KEYWORDS),
-            _split_keywords(cfg.MOVIE_OTHER_KEYWORDS),
-        ]
-    flat: list[str] = [kw for bucket in buckets for kw in bucket]
-    return _dedupe_preserve_order(flat)
+        buckets = OD()
+        buckets["audio"] = _split_keywords(cfg.MOVIE_AUDIO_KEYWORDS)
+        buckets["video"] = _split_keywords(cfg.MOVIE_VIDEO_KEYWORDS)
+        buckets["subtitle"] = _split_keywords(cfg.MOVIE_SUBTITLE_KEYWORDS)
+        buckets["wrong"] = _split_keywords(cfg.MOVIE_WRONG_KEYWORDS)
+        buckets["other"] = _split_keywords(cfg.MOVIE_OTHER_KEYWORDS)
+    # de-dupe within each
+    for k in list(buckets.keys()):
+        buckets[k] = _dedupe_preserve_order(buckets[k])
+    return buckets
+
+
+def _keywords_text_grouped(media_type: str) -> str:
+    """
+    Render grouped keywords like:
+      "audio: no audio, no sound | video: no video, black screen | subtitle: missing subs"
+    """
+    buckets = _keyword_buckets_for_media(media_type)
+    parts = []
+    for name, kws in buckets.items():
+        if kws:
+            parts.append(f"{name}: {', '.join(kws)}")
+    return " | ".join(parts) if parts else "no keywords configured"
 
 
 def _match_bucket(media_type: str, text: str) -> Optional[str]:
@@ -183,20 +196,20 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
 
     if not series:
         if issue_id:
-            await jelly_comment(issue_id, _ensure_prefixed(
+            msg = _ensure_prefixed(
                 f"Series not found in Sonarr. Title: {title or 'unknown'} "
                 f"{f'({year})' if year else ''} {f'[tvdb:{tvdb}]' if tvdb else ''} {f'[imdb:{imdb}]' if imdb else ''}"
-            ))
+            )
+            log.info("Outgoing comment (not found): %r", msg)
+            await jelly_comment(issue_id, msg, force_prefix=False)
         return {"found": False, "acted": False}
 
     series_id = int(series["id"])
-    all_kws = _keywords_for_media("series")
-    kws_text = ", ".join(all_kws) if all_kws else "no keywords configured"
+    kws_text = _keywords_text_grouped("series")
 
     # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
-            # If user provided a template, let it render; otherwise include the keyword list.
             template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
             coach = template.format(
                 title=title or series.get("title") or "Unknown",
@@ -206,17 +219,17 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
             )
             coach_pref = _ensure_prefixed(coach)
             if not await _already_posted_same(issue_id, coach_pref):
-                await jelly_comment(issue_id, coach_pref)
+                log.info("Outgoing coaching comment: %r", coach_pref[:300])
+                await jelly_comment(issue_id, coach_pref, force_prefix=False)
         return {"found": True, "acted": False, "seriesId": series_id}
 
     # Delete episode file(s)
     ep_ids = await S.find_episode_ids(series_id, season, episode)
     deleted = await S.delete_episodefiles_by_episode_ids(ep_ids)
-
     if issue_id:
-        await jelly_comment(issue_id, _ensure_prefixed(
-            f"Queued replacement: removed {deleted} episode file(s). Triggering search…"
-        ))
+        msg = _ensure_prefixed(f"Queued replacement: removed {deleted} episode file(s). Triggering search…")
+        log.info("Outgoing comment: %r", msg)
+        await jelly_comment(issue_id, msg, force_prefix=False)
 
     # Trigger search + verify
     await S.search_series(series_id)
@@ -245,7 +258,9 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                 episode=0,
                 keywords=kws_text,
             )
-        await jelly_comment(issue_id, _ensure_prefixed(msg))
+        msg = _ensure_prefixed(msg)
+        log.info("Outgoing success comment: %r", msg[:300])
+        await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "seriesId": series_id, "queued": True}
@@ -254,12 +269,14 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
     if issue_id:
         fail = (cfg.MSG_AUTOCLOSE_FAIL or
                 "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
-        await jelly_comment(issue_id, _ensure_prefixed(fail.format(
+        msg = _ensure_prefixed(fail.format(
             title=title or series.get("title") or "Unknown",
             season=season or 0,
             episode=episode or 0,
             keywords=kws_text,
-        )))
+        ))
+        log.info("Outgoing fail comment: %r", msg[:300])
+        await jelly_comment(issue_id, msg, force_prefix=False)
     return {"found": True, "acted": True, "seriesId": series_id, "queued": False}
 
 
@@ -274,15 +291,16 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
 
     if not movie:
         if issue_id:
-            await jelly_comment(issue_id, _ensure_prefixed(
+            msg = _ensure_prefixed(
                 f"Movie not found in Radarr. Title: {title or 'unknown'} "
                 f"{f'({year})' if year else ''} {f'[tmdb:{tmdb}]' if tmdb else ''} {f'[imdb:{imdb}]' if imdb else ''}"
-            ))
+            )
+            log.info("Outgoing comment (not found): %r", msg)
+            await jelly_comment(issue_id, msg, force_prefix=False)
         return {"found": False, "acted": False}
 
     movie_id = int(movie["id"])
-    all_kws = _keywords_for_media("movie")
-    kws_text = ", ".join(all_kws) if all_kws else "no keywords configured"
+    kws_text = _keywords_text_grouped("movie")
 
     # No keywords? Coach and exit (but only once).
     if not bucket:
@@ -296,16 +314,16 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
             )
             coach_pref = _ensure_prefixed(coach)
             if not await _already_posted_same(issue_id, coach_pref):
-                await jelly_comment(issue_id, coach_pref)
+                log.info("Outgoing coaching comment: %r", coach_pref[:300])
+                await jelly_comment(issue_id, coach_pref, force_prefix=False)
         return {"found": True, "acted": False, "movieId": movie_id}
 
     # Delete movie files (keep library entry)
     deleted = await R.delete_moviefiles(movie_id)
-
     if issue_id:
-        await jelly_comment(issue_id, _ensure_prefixed(
-            f"Queued replacement: removed {deleted} movie file(s). Triggering search…"
-        ))
+        msg = _ensure_prefixed(f"Queued replacement: removed {deleted} movie file(s). Triggering search…")
+        log.info("Outgoing comment: %r", msg)
+        await jelly_comment(issue_id, msg, force_prefix=False)
 
     # Trigger search + verify
     await R.search_movie(movie_id)
@@ -323,7 +341,9 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
             episode=0,
             keywords=kws_text,
         )
-        await jelly_comment(issue_id, _ensure_prefixed(msg))
+        msg = _ensure_prefixed(msg)
+        log.info("Outgoing success comment: %r", msg[:300])
+        await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "movieId": movie_id, "queued": True}
@@ -331,12 +351,14 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
     if issue_id:
         fail = (cfg.MSG_AUTOCLOSE_FAIL or
                 "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
-        await jelly_comment(issue_id, _ensure_prefixed(fail.format(
+        msg = _ensure_prefixed(fail.format(
             title=title or movie.get("title") or "Unknown",
             season=0,
             episode=0,
             keywords=kws_text,
-        )))
+        ))
+        log.info("Outgoing fail comment: %r", msg[:300])
+        await jelly_comment(issue_id, msg, force_prefix=False)
     return {"found": True, "acted": True, "movieId": movie_id, "queued": False}
 
 
@@ -346,11 +368,14 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Ignore our own comments regardless of event string.
+    # Inbound comment (for logging + self-loop guard)
     comment = payload.get("comment") or {}
     comment_text = (comment.get("text") or comment.get("message") or "").strip()
-    if comment_text and is_our_comment(comment_text):
-        return {"ok": True, "ignored": "own_comment"}
+    if comment_text:
+        log.info("Inbound comment text: %r", comment_text.replace("\n", " ")[:300])
+        if is_our_comment(comment_text):
+            log.info("Ignoring own comment.")
+            return {"ok": True, "ignored": "own_comment"}
 
     event = (payload.get("event") or "").lower()
     issue = payload.get("issue") or {}
@@ -365,11 +390,12 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         event or "unknown", issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
     )
 
-    # Optional human ack on user comments (but only if it's not ours)
+    # Optional ack on user comments (not ours)
     if event.find("comment") != -1 and comment_text and not is_our_comment(comment_text) and cfg.ACK_ON_COMMENT_CREATED and issue_id:
-        await jelly_comment(issue_id, _ensure_prefixed("Thanks! Running automated remediation…"))
+        msg = _ensure_prefixed("Thanks! Running automated remediation…")
+        log.info("Outgoing ack comment: %r", msg)
+        await jelly_comment(issue_id, msg, force_prefix=False)
 
-    # Act based on media type
     if media_type == "series":
         detail = await _handle_series(issue_id, tvdb, imdb, title, year, season, episode, bucket)
     else:
