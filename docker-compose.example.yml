@@ -19,12 +19,13 @@ services:
     ports:
       - "8189:8189"
 
-healthcheck:
-  test: ["CMD", "curl", "-fsS", "http://localhost:8189/"]
-  interval: 30s
-  timeout: 5s
-  retries: 3
-  start_period: 10s
+    # Healthcheck for container status
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8189/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
     # Keep logs under control (optional)
     logging:
