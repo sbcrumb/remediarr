@@ -5,29 +5,56 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-from app.config import cfg
+from app.config import cfg, BOT_PREFIX
 from app.logging import log
 
+
 def _headers() -> Dict[str, str]:
+    # Keep your existing header set. Many Jellyseerr installs accept either X-Api-Key
+    # or Authorization. Having both doesn’t hurt.
     return {
         "X-Api-Key": cfg.JELLYSEERR_API_KEY,
         "Authorization": f"Bearer {cfg.JELLYSEERR_API_KEY}",
         "Content-Type": "application/json",
     }
 
+
 def _base() -> str:
     return cfg.JELLYSEERR_URL.rstrip("/")
 
-async def jelly_comment(issue_id: Any, message: str) -> bool:
+
+def _with_prefix(msg: str) -> str:
+    """Hard-attach the bot prefix if it's not already there."""
+    m = (msg or "").lstrip()
+    if not m.startswith(BOT_PREFIX):
+        return f"{BOT_PREFIX} {msg}".strip()
+    return msg
+
+
+def is_our_comment(text: Optional[str]) -> bool:
+    """
+    True if a comment originated from Remediarr (used for loop protection).
+    Leading whitespace is ignored.
+    """
+    if not text:
+        return False
+    return text.lstrip().startswith(BOT_PREFIX)
+
+
+async def jelly_comment(issue_id: Any, message: str, *, force_prefix: bool = True) -> bool:
     """
     Post a comment to an issue. Tries both known paths:
       - /api/v1/issue/{id}/comment
       - /api/v1/issues/{id}/comments   (plural)
     Returns True on 200/201/204, else False.
+
+    By default we FORCE-prefix the message with BOT_PREFIX so users cannot
+    accidentally remove it in .env templates.
     """
     if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
         return False
 
+    payload_msg = _with_prefix(message) if force_prefix else (message or "")
     paths = [
         f"/api/v1/issue/{issue_id}/comment",
         f"/api/v1/issues/{issue_id}/comments",
@@ -35,13 +62,22 @@ async def jelly_comment(issue_id: Any, message: str) -> bool:
     async with httpx.AsyncClient(timeout=20) as c:
         for p in paths:
             try:
-                r = await c.post(f"{_base()}{p}", headers=_headers(), json={"message": message})
+                r = await c.post(f"{_base()}{p}", headers=_headers(), json={"message": payload_msg})
                 if r.status_code in (200, 201, 204):
                     return True
                 log.info("jelly_comment %s -> %s %s", p, r.status_code, r.text[:180])
             except Exception as e:
                 log.info("jelly_comment error %s: %s", p, e)
     return False
+
+
+async def jelly_comment_raw(issue_id: Any, message: str) -> bool:
+    """
+    Post a comment EXACTLY as given (no forced prefix). Handy if the caller has
+    already composed a fully prefixed message.
+    """
+    return await jelly_comment(issue_id, message, force_prefix=False)
+
 
 async def jelly_close(issue_id: Any) -> bool:
     """
@@ -61,14 +97,20 @@ async def jelly_close(issue_id: Any) -> bool:
     async with httpx.AsyncClient(timeout=20) as c:
         for method, path, json_body, query in attempts:
             try:
-                r = await c.request(method, f"{_base()}{path}",
-                                    headers=_headers(), json=json_body, params=query)
+                r = await c.request(
+                    method,
+                    f"{_base()}{path}",
+                    headers=_headers(),
+                    json=json_body,
+                    params=query,
+                )
                 if r.status_code in (200, 201, 204):
                     return True
                 log.info("jelly_close %s %s -> %s %s", method, path, r.status_code, r.text[:180])
             except Exception as e:
                 log.info("jelly_close error %s %s", path, e)
     return False
+
 
 async def jelly_fetch_issue(issue_id: Any) -> Optional[Dict[str, Any]]:
     """
