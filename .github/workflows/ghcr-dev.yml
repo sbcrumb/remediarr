@@ -27,7 +27,7 @@ jobs:
           SHA7="${GITHUB_SHA::7}"
           echo "SHA7=$SHA7" >> $GITHUB_ENV
           echo "DEV_TAGS=ghcr.io/${GITHUB_REPOSITORY}:dev,ghcr.io/${GITHUB_REPOSITORY}:dev-${SHA7}" >> $GITHUB_ENV
-          echo "Computed DEV_TAGS=${{ env.DEV_TAGS }}"
+          echo "Computed DEV_TAGS=${DEV_TAGS}"
 
       - name: Set up QEMU
         if: ${{ env.PLATFORMS == 'linux/amd64,linux/arm64' }}
@@ -53,7 +53,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.DEV_TAGS }}
           build-args: |
-            VERSION=dev-${{ env.SHA7 }}
+            APP_VERSION=dev-${{ env.SHA7 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
