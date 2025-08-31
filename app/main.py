@@ -1,9 +1,10 @@
 # app/main.py
-# Remediarr: FastAPI entrypoint with startup banner + Radarr/Sonarr health checks.
+# Remediarr FastAPI entrypoint:
 # - Logs version on boot
-# - Optionally pings Radarr/Sonarr and (if configured) sends a Gotify/Apprise notice
+# - ALWAYS pings Radarr & Sonarr at startup (logs results)
+# - Optionally notifies via Gotify/Apprise if configured
 # - Mounts the Jellyseerr webhook router
-# - Exposes GET / health endpoint
+# - GET / returns health + version
 
 import os
 import logging
@@ -13,7 +14,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-# NOTE: use the package-qualified import because this module is inside the "app" package.
+# IMPORTANT: use package-qualified import
 from app.webhooks.router import router as jellyseerr_router  # POST /webhook/jellyseerr
 
 # ---------------- Logging ----------------
@@ -24,7 +25,6 @@ log = logging.getLogger("remediarr")
 # ---------------- App & env ----------------
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", "8189"))
-STARTUP_HEALTHCHECKS = os.getenv("STARTUP_HEALTHCHECKS", "true").lower() == "true"
 
 # Radarr
 RADARR_URL = (os.getenv("RADARR_URL", "http://radarr:7878") or "").rstrip("/")
@@ -40,6 +40,7 @@ SONARR_HTTP_TIMEOUT = float(os.getenv("SONARR_HTTP_TIMEOUT", "60"))
 GOTIFY_URL = (os.getenv("GOTIFY_URL", "") or "").rstrip("/")
 GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN", "") or ""
 GOTIFY_PRIORITY = int(os.getenv("GOTIFY_PRIORITY", "5"))
+
 APPRISE_URL = (os.getenv("APPRISE_URL", "") or "").rstrip("/")
 APPRISE_TARGETS = [u.strip() for u in (os.getenv("APPRISE_TARGETS", "") or "").split(",") if u.strip()]
 
@@ -127,16 +128,13 @@ async def _on_startup():
     log.info(" Remediarr starting — version: %s", version)
     log.info("===========================================")
 
-    if not STARTUP_HEALTHCHECKS:
-        log.info("Startup healthchecks disabled (STARTUP_HEALTHCHECKS=false).")
-        return
-
+    # ALWAYS run health checks (log results)
     r_ok, r_msg = await _ping_radarr()
     s_ok, s_msg = await _ping_sonarr()
-
     log.info("Healthcheck: Radarr -> %s", r_msg)
     log.info("Healthcheck: Sonarr -> %s", s_msg)
 
+    # Notifications are OPTIONAL (only if configured)
     if r_ok and s_ok:
         await _notify("Remediarr up", f"{version} ready. Radarr OK ({r_msg}); Sonarr OK ({s_msg}).")
     else:
