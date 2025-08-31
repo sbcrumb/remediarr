@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from time import monotonic
 from typing import Any, Dict, Optional, Tuple, Iterable, OrderedDict
 
 from fastapi import HTTPException
@@ -10,6 +11,27 @@ from app.logging import log
 from app.services.jellyseerr import jelly_comment, jelly_close, is_our_comment, jelly_fetch_issue
 from app.services import sonarr as S
 from app.services import radarr as R
+
+
+# ---------- simple per-issue cooldown to stop loops ----------
+_RECENT_ACTIONS: dict[int, float] = {}
+_COOLDOWN_SEC: int = getattr(cfg, "ACTION_COOLDOWN_SEC", 120)
+
+
+def _under_cooldown(issue_id: Optional[int]) -> bool:
+    if not issue_id:
+        return False
+    now = monotonic()
+    last = _RECENT_ACTIONS.get(issue_id, 0.0)
+    if last and (now - last) < _COOLDOWN_SEC:
+        log.info("Issue %s under cooldown (%.0fs remaining) — skipping repeat action.", issue_id, _COOLDOWN_SEC - (now - last))
+        return True
+    return False
+
+
+def _mark_action(issue_id: Optional[int]) -> None:
+    if issue_id:
+        _RECENT_ACTIONS[int(issue_id)] = monotonic()
 
 
 # ---------- helpers ----------
@@ -34,9 +56,6 @@ def _pick_int(x: Any) -> Optional[int]:
 
 
 def _extract_media(payload: Dict[str, Any]) -> Tuple[str, Optional[int], Optional[int], Optional[str], Optional[str], Optional[int], Optional[int], Optional[int]]:
-    """
-    Return (media_type, tmdbId, tvdbId, imdbId, title, year, season, episode)
-    """
     media = payload.get("media") or {}
     issue = payload.get("issue") or {}
     req = payload.get("request") or {}
@@ -124,10 +143,6 @@ def _keywords_text_grouped(media_type: str) -> str:
 
 
 def _match_bucket(media_type: str, text: str) -> Optional[str]:
-    """
-    Return a logical bucket name if any keyword matches, else None.
-    Buckets: audio, video, subtitle, wrong (movies only), other
-    """
     t = (text or "").lower()
     if not t:
         return None
@@ -146,7 +161,6 @@ def _match_bucket(media_type: str, text: str) -> Optional[str]:
 
 
 def _latest_human_comment_text(issue_json: Dict[str, Any] | None) -> Optional[str]:
-    """Return the most recent non-bot comment text from the issue JSON."""
     if not issue_json:
         return None
     comments = issue_json.get("comments") or issue_json.get("activity") or []
@@ -170,7 +184,6 @@ async def _poll_until(predicate_coro, timeout_sec: int, interval_sec: int) -> bo
 
 
 async def _already_posted_same(issue_id: Optional[int], intended_msg_prefixed: str) -> bool:
-    """Best-effort de-dupe: if our last comment equals intended message, skip."""
     if not issue_id:
         return False
     try:
@@ -205,8 +218,8 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                 f"Series not found in Sonarr. Title: {title or 'unknown'} "
                 f"{f'({year})' if year else ''} {f'[tvdb:{tvdb}]' if tvdb else ''} {f'[imdb:{imdb}]' if imdb else ''}"
             )
-            log.info("Outgoing comment (not found): %r", msg)
-            await jelly_comment(issue_id, msg, force_prefix=False)
+            if not await _already_posted_same(issue_id, msg):
+                await jelly_comment(issue_id, msg, force_prefix=False)
         return {"found": False, "acted": False}
 
     series_id = int(series["id"])
@@ -215,30 +228,26 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
     if not bucket:
         if issue_id:
             template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
-            coach = template.format(
+            coach = _ensure_prefixed(template.format(
                 title=title or series.get("title") or "Unknown",
                 season=season or 0,
                 episode=episode or 0,
                 keywords=kws_text,
-            )
-            coach_pref = _ensure_prefixed(coach)
-            if not await _already_posted_same(issue_id, coach_pref):
-                log.info("Outgoing coaching comment: %r", coach_pref[:300])
-                await jelly_comment(issue_id, coach_pref, force_prefix=False)
+            ))
+            if not await _already_posted_same(issue_id, coach):
+                await jelly_comment(issue_id, coach, force_prefix=False)
         return {"found": True, "acted": False, "seriesId": series_id}
 
-    ep_ids = await S.find_episode_ids(series_id, season, episode)
-    deleted = await S.delete_episodefiles_by_episode_ids(ep_ids)
+    deleted = await S.delete_episodefiles_by_episode_ids(await S.find_episode_ids(series_id, season, episode))
     if issue_id:
         msg = _ensure_prefixed(f"Queued replacement: removed {deleted} episode file(s). Triggering search…")
-        log.info("Outgoing comment: %r", msg)
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
 
     await S.search_series(series_id)
-    grabbed_pred = lambda: S.history_has_recent_grab(series_id, cfg.SONARR_VERIFY_GRAB_SEC)
-    queue_pred = lambda: S.queue_has_series(series_id)
-    ok = await _poll_until(grabbed_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) or \
-         await _poll_until(queue_pred, cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
+
+    ok = await _poll_until(lambda: S.history_has_recent_grab(series_id, cfg.SONARR_VERIFY_GRAB_SEC), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) \
+         or await _poll_until(lambda: S.queue_has_series(series_id), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
         if season is not None and episode is not None:
@@ -255,13 +264,11 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                    "{title}: new downloads are being grabbed. Closing this issue.")
             msg = msg.format(
                 title=title or series.get("title") or "Unknown",
-                season=0,
-                episode=0,
-                keywords=kws_text,
+                season=0, episode=0, keywords=kws_text,
             )
         msg = _ensure_prefixed(msg)
-        log.info("Outgoing success comment: %r", msg[:300])
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "seriesId": series_id, "queued": True}
@@ -271,12 +278,10 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                 "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
         msg = _ensure_prefixed(fail.format(
             title=title or series.get("title") or "Unknown",
-            season=season or 0,
-            episode=episode or 0,
-            keywords=kws_text,
+            season=season or 0, episode=episode or 0, keywords=kws_text,
         ))
-        log.info("Outgoing fail comment: %r", msg[:300])
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
     return {"found": True, "acted": True, "seriesId": series_id, "queued": False}
 
 
@@ -294,8 +299,8 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
                 f"Movie not found in Radarr. Title: {title or 'unknown'} "
                 f"{f'({year})' if year else ''} {f'[tmdb:{tmdb}]' if tmdb else ''} {f'[imdb:{imdb}]' if imdb else ''}"
             )
-            log.info("Outgoing comment (not found): %r", msg)
-            await jelly_comment(issue_id, msg, force_prefix=False)
+            if not await _already_posted_same(issue_id, msg):
+                await jelly_comment(issue_id, msg, force_prefix=False)
         return {"found": False, "acted": False}
 
     movie_id = int(movie["id"])
@@ -304,42 +309,37 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
     if not bucket:
         if issue_id:
             template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
-            coach = template.format(
+            coach = _ensure_prefixed(template.format(
                 title=title or movie.get("title") or "Unknown",
-                season=0,
-                episode=0,
-                keywords=kws_text,
-            )
-            coach_pref = _ensure_prefixed(coach)
-            if not await _already_posted_same(issue_id, coach_pref):
-                log.info("Outgoing coaching comment: %r", coach_pref[:300])
-                await jelly_comment(issue_id, coach_pref, force_prefix=False)
+                season=0, episode=0, keywords=kws_text,
+            ))
+            if not await _already_posted_same(issue_id, coach):
+                await jelly_comment(issue_id, coach, force_prefix=False)
         return {"found": True, "acted": False, "movieId": movie_id}
 
+    # Delete files (if any)
     deleted = await R.delete_moviefiles(movie_id)
     if issue_id:
         msg = _ensure_prefixed(f"Queued replacement: removed {deleted} movie file(s). Triggering search…")
-        log.info("Outgoing comment: %r", msg)
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
 
+    # Trigger search (fixed payload)
     await R.search_movie(movie_id)
-    grabbed_pred = lambda: R.history_has_recent_grab(movie_id, cfg.RADARR_VERIFY_GRAB_SEC)
-    queue_pred = lambda: R.queue_has_movie(movie_id)
-    ok = await _poll_until(grabbed_pred, cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC) or \
-         await _poll_until(queue_pred, cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC)
+
+    # Verify using queue primarily; history is best-effort
+    ok = await _poll_until(lambda: R.queue_has_movie(movie_id), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC) \
+         or await _poll_until(lambda: R.history_has_recent_grab(movie_id, cfg.RADARR_VERIFY_GRAB_SEC), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
         msg = (cfg.MSG_MOVIE_REPLACED_AND_GRABBED or
                "{title}: replaced file; new download grabbed. Closing this issue.")
-        msg = msg.format(
+        msg = _ensure_prefixed(msg.format(
             title=title or movie.get("title") or "Unknown",
-            season=0,
-            episode=0,
-            keywords=kws_text,
-        )
-        msg = _ensure_prefixed(msg)
-        log.info("Outgoing success comment: %r", msg[:300])
-        await jelly_comment(issue_id, msg, force_prefix=False)
+            season=0, episode=0, keywords=kws_text,
+        ))
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "movieId": movie_id, "queued": True}
@@ -349,12 +349,10 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
                 "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
         msg = _ensure_prefixed(fail.format(
             title=title or movie.get("title") or "Unknown",
-            season=0,
-            episode=0,
-            keywords=kws_text,
+            season=0, episode=0, keywords=kws_text,
         ))
-        log.info("Outgoing fail comment: %r", msg[:300])
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        if not await _already_posted_same(issue_id, msg):
+            await jelly_comment(issue_id, msg, force_prefix=False)
     return {"found": True, "acted": True, "movieId": movie_id, "queued": False}
 
 
@@ -381,7 +379,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = _gather_text_for_keywords(payload)
     bucket = _match_bucket(media_type, text)
 
-    # Fallback: if no payload comment or no bucket match, fetch the issue and scan the latest human comment
+    # Fallback scan from latest human comment
     if (not comment_text or not text) or bucket is None:
         issue_json = await jelly_fetch_issue(issue_id) if issue_id else None
         last_human = _latest_human_comment_text(issue_json)
@@ -397,14 +395,20 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         "Webhook event=%s issue_id=%s media_type=%s tmdb=%s tvdb=%s imdb=%s title=%s year=%s season=%s episode=%s bucket=%s",
         event or "unknown", issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
     )
-    if text:
-        log.debug("Keyword scan text preview: %r", text[:300])
+
+    # Prevent repeated actions on the same issue for a short period
+    if bucket and _under_cooldown(issue_id):
+        return {"ok": True, "ignored": "cooldown"}
 
     # Optional ack on user comments (not ours)
     if event.find("comment") != -1 and comment_text and not is_our_comment(comment_text) and cfg.ACK_ON_COMMENT_CREATED and issue_id:
-        msg = _ensure_prefixed("Thanks! Running automated remediation…")
-        log.info("Outgoing ack comment: %r", msg)
-        await jelly_comment(issue_id, msg, force_prefix=False)
+        ack = _ensure_prefixed("Thanks! Running automated remediation…")
+        if not await _already_posted_same(issue_id, ack):
+            await jelly_comment(issue_id, ack, force_prefix=False)
+
+    # Mark action moment (so subsequent webhooks within N sec are skipped)
+    if bucket:
+        _mark_action(issue_id)
 
     if media_type == "series":
         detail = await _handle_series(issue_id, tvdb, imdb, title, year, season, episode, bucket)
