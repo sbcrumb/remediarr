@@ -1,122 +1,131 @@
-import asyncio
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+
 import httpx
-from typing import Any, Dict, List, Optional, Tuple
 
-from app.config import RADARR_URL, RADARR_API_KEY
-from app.http import retry_http
-
-
-def _params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    base = {"apikey": RADARR_API_KEY}
-    if extra:
-        base.update(extra)
-    return base
+from app.config import cfg
+from app.logging import log
 
 
-async def get_system_status() -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{RADARR_URL}/api/v3/system/status", params=_params())
-        r.raise_for_status()
-        return r.json()
+def _base() -> str:
+    return cfg.RADARR_URL.rstrip("/")
 
 
-async def get_movie_by_tmdb(tmdb_id: int) -> Optional[Dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{RADARR_URL}/api/v3/movie", params=_params({"tmdbId": tmdb_id}))
-        r.raise_for_status()
-        items = r.json()
-        return items[0] if isinstance(items, list) and items else None
+def _headers() -> Dict[str, str]:
+    return {"X-Api-Key": cfg.RADARR_API_KEY}
 
 
-async def list_movie_files(movie_id: int) -> List[Dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{RADARR_URL}/api/v3/moviefile", params=_params({"movieId": movie_id}))
-        r.raise_for_status()
-        return r.json()
+async def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.RADARR_HTTP_TIMEOUT) as c:
+            r = await c.get(url, headers=_headers(), params=params)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        log.info("Radarr GET %s failed: %s", path, e)
+        return None
 
 
-async def delete_movie_file(movie_file_id: int) -> None:
-    async with httpx.AsyncClient(timeout=30) as c:
-        async def _do():
-            return await c.delete(f"{RADARR_URL}/api/v3/moviefile/{movie_file_id}", params=_params())
-        await retry_http(_do, what=f"radarr delete moviefile {movie_file_id}")
+async def _post_json(path: str, json: Dict[str, Any]) -> Optional[Any]:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.RADARR_HTTP_TIMEOUT) as c:
+            r = await c.post(url, headers=_headers(), json=json)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        log.info("Radarr POST %s failed: %s", path, e)
+        return None
 
 
-async def get_movie_history(movie_id: int) -> List[Dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{RADARR_URL}/api/v3/history/movie", params=_params({"movieId": movie_id}))
-        r.raise_for_status()
-        return r.json()
-
-
-async def mark_history_failed(history_id: int) -> None:
-    async with httpx.AsyncClient(timeout=30) as c:
-        async def _do():
-            return await c.post(f"{RADARR_URL}/api/v3/history/failed/{history_id}", params=_params())
-        await retry_http(_do, what=f"radarr mark failed {history_id}")
-
-
-async def search_movie(movie_id: int) -> None:
-    payload = {"name": "MoviesSearch", "movieIds": [movie_id]}
-    async with httpx.AsyncClient(timeout=30) as c:
-        async def _do():
-            return await c.post(f"{RADARR_URL}/api/v3/command", params=_params(), json=payload)
-        await retry_http(_do, what=f"radarr MoviesSearch movieId={movie_id}")
-
-
-async def queue_contains_movie(movie_id: int) -> bool:
-    """Check if Radarr queue currently has this movie."""
-    async with httpx.AsyncClient(timeout=20) as c:
-        # Radarr queue can be paged; keep it simple and fetch first page with large size
-        r = await c.get(
-            f"{RADARR_URL}/api/v3/queue",
-            params=_params({"page": 1, "pageSize": 100, "includeUnknownSeriesItems": "true"}),
-        )
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("records") if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            return False
-        for it in items:
-            if int(it.get("movieId", -1)) == int(movie_id):
-                return True
+async def _delete(path: str) -> bool:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.RADARR_HTTP_TIMEOUT) as c:
+            r = await c.delete(url, headers=_headers())
+            return r.status_code in (200, 202, 204)
+    except Exception as e:
+        log.info("Radarr DELETE %s failed: %s", path, e)
         return False
 
 
-async def wait_until_movie_queued(movie_id: int, timeout_sec: int = 25, poll_sec: float = 2.0) -> bool:
-    """Poll Radarr queue briefly to see if a search resulted in something queued."""
-    total = 0.0
-    while total < timeout_sec:
-        if await queue_contains_movie(movie_id):
+async def _get_all_movies() -> List[Dict[str, Any]]:
+    data = await _get_json("/api/v3/movie")
+    return data if isinstance(data, list) else []
+
+
+async def get_movie_by_tmdb(tmdb_id: int) -> Optional[Dict[str, Any]]:
+    items = await _get_all_movies()
+    for m in items:
+        if int(m.get("tmdbId") or 0) == int(tmdb_id):
+            return m
+    return None
+
+
+async def get_movie_by_imdb(imdb_id: str) -> Optional[Dict[str, Any]]:
+    items = await _get_all_movies()
+    for m in items:
+        prov = (m.get("imdbId") or "") or (m.get("foreignId") or "")
+        if isinstance(prov, str) and prov.lower().replace("imdb:", "") == imdb_id.lower().replace("imdb:", ""):
+            return m
+    return None
+
+
+async def list_moviefiles(movie_id: int) -> List[int]:
+    files = await _get_json("/api/v3/moviefile", params={"movieId": movie_id})
+    if not isinstance(files, list):
+        return []
+    return [int(f["id"]) for f in files if f.get("id")]
+
+
+async def delete_moviefiles(movie_id: int) -> int:
+    ids = await list_moviefiles(movie_id)
+    deleted = 0
+    for fid in ids:
+        if await _delete(f"/api/v3/moviefile/{fid}"):
+            deleted += 1
+    return deleted
+
+
+async def search_movie(movie_id: int) -> bool:
+    # Radarr accepts "MoviesSearch" with movieIds OR "MovieSearch" with movieId (both work on recent builds)
+    cmd = {"name": "MovieSearch", "movieId": movie_id}
+    return bool(await _post_json("/api/v3/command", cmd))
+
+
+async def queue_has_movie(movie_id: int) -> bool:
+    q = await _get_json("/api/v3/queue", params={"pageSize": 50})
+    items = q.get("records") if isinstance(q, dict) else (q if isinstance(q, list) else [])
+    for it in items:
+        if int(it.get("movieId") or 0) == int(movie_id):
             return True
-        await asyncio.sleep(poll_sec)
-        total += poll_sec
     return False
 
 
-async def fail_last_grab_delete_files_and_search(movie_id: int) -> Tuple[int, bool]:
-    """
-    Mark last grab failed (if present), delete all files, trigger a search.
-    Returns (deleted_count, queued_now)
-    """
-    hist = await get_movie_history(movie_id)
-    grabbed = next((h for h in hist if str(h.get("eventType", "")).lower() == "grabbed"), None)
-    if grabbed:
+async def history_has_recent_grab(movie_id: int, window_seconds: int) -> bool:
+    params = {"eventType": "grabbed", "movieId": movie_id, "pageSize": 20, "page": 1}
+    hist = await _get_json("/api/v3/history", params=params)
+    now = datetime.now(timezone.utc)
+    items = []
+    if isinstance(hist, dict):
+        items = hist.get("records") or hist.get("results") or []
+    elif isinstance(hist, list):
+        items = hist
+    for h in items:
+        ds = h.get("date") or h.get("eventDate") or h.get("updated")
+        if not ds:
+            continue
         try:
-            await mark_history_failed(int(grabbed["id"]))
+            ts = datetime.fromisoformat(ds.replace("Z", "+00:00"))
         except Exception:
-            pass
-
-    files = await list_movie_files(movie_id)
-    deleted = 0
-    for f in files:
-        try:
-            await delete_movie_file(int(f["id"]))
-            deleted += 1
-        except Exception:
-            # ignore individual delete failures
-            pass
-
-    await search_movie(movie_id)
-    queued = await wait_until_movie_queued(movie_id)
-    return deleted, queued
+            continue
+        if now - ts <= timedelta(seconds=window_seconds):
+            return True
+    return False

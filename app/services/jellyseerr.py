@@ -1,4 +1,3 @@
-# app/services/jellyseerr.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
@@ -10,8 +9,6 @@ from app.logging import log
 
 
 def _headers() -> Dict[str, str]:
-    # Keep your existing header set. Many Jellyseerr installs accept either X-Api-Key
-    # or Authorization. Having both doesn’t hurt.
     return {
         "X-Api-Key": cfg.JELLYSEERR_API_KEY,
         "Authorization": f"Bearer {cfg.JELLYSEERR_API_KEY}",
@@ -24,36 +21,23 @@ def _base() -> str:
 
 
 def _with_prefix(msg: str) -> str:
-    """Hard-attach the bot prefix if it's not already there."""
     m = (msg or "").lstrip()
+    if not m:
+        return m
     if not m.startswith(BOT_PREFIX):
         return f"{BOT_PREFIX} {msg}".strip()
     return msg
 
 
 def is_our_comment(text: Optional[str]) -> bool:
-    """
-    True if a comment originated from Remediarr (used for loop protection).
-    Leading whitespace is ignored.
-    """
     if not text:
         return False
     return text.lstrip().startswith(BOT_PREFIX)
 
 
 async def jelly_comment(issue_id: Any, message: str, *, force_prefix: bool = True) -> bool:
-    """
-    Post a comment to an issue. Tries both known paths:
-      - /api/v1/issue/{id}/comment
-      - /api/v1/issues/{id}/comments   (plural)
-    Returns True on 200/201/204, else False.
-
-    By default we FORCE-prefix the message with BOT_PREFIX so users cannot
-    accidentally remove it in .env templates.
-    """
     if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
         return False
-
     payload_msg = _with_prefix(message) if force_prefix else (message or "")
     paths = [
         f"/api/v1/issue/{issue_id}/comment",
@@ -71,70 +55,23 @@ async def jelly_comment(issue_id: Any, message: str, *, force_prefix: bool = Tru
     return False
 
 
-async def jelly_comment_raw(issue_id: Any, message: str) -> bool:
-    """
-    Post a comment EXACTLY as given (no forced prefix). Handy if the caller has
-    already composed a fully prefixed message.
-    """
-    return await jelly_comment(issue_id, message, force_prefix=False)
-
-
 async def jelly_close(issue_id: Any) -> bool:
-    """
-    Best-effort close. Many servers expose POST /api/v1/issue/{id}/resolved (200 OK).
-    Tries a few variants and returns True on success.
-    """
     if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
         return False
-
-    attempts: Tuple[Tuple[str, str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], ...] = (
-        ("POST", f"/api/v1/issue/{issue_id}/resolved", None, None),
-        # legacy/variants sometimes seen
-        ("POST", f"/api/v1/issue/{issue_id}/resolve", None, {"status": "resolved"}),
-        ("POST", f"/api/v1/issue/{issue_id}/status", {"status": "resolved"}, None),
+    attempts: Tuple[Tuple[str, str, Optional[Dict[str, Any]]], ...] = (
+        ("POST", f"/api/v1/issue/{issue_id}/resolved", None),
+        ("POST", f"/api/v1/issue/{issue_id}/resolve", None),
+        ("POST", f"/api/v1/issue/{issue_id}/status", {"status": "resolved"}),
     )
-
     async with httpx.AsyncClient(timeout=20) as c:
-        for method, path, json_body, query in attempts:
+        for _, path, body in attempts:
             try:
-                r = await c.request(
-                    method,
-                    f"{_base()}{path}",
-                    headers=_headers(),
-                    json=json_body,
-                    params=query,
-                )
-                if r.status_code in (200, 201, 204):
+                r = await c.post(f"{_base()}{path}", headers=_headers(), json=body)
+                if r.status_code in (200, 204):
+                    if cfg.JELLYSEERR_CLOSE_MESSAGE:
+                        await jelly_comment(issue_id, cfg.JELLYSEERR_CLOSE_MESSAGE, force_prefix=True)
                     return True
-                log.info("jelly_close %s %s -> %s %s", method, path, r.status_code, r.text[:180])
+                log.info("jelly_close %s -> %s %s", path, r.status_code, r.text[:180])
             except Exception as e:
-                log.info("jelly_close error %s %s", path, e)
+                log.info("jelly_close error %s: %s", path, e)
     return False
-
-
-async def jelly_fetch_issue(issue_id: Any) -> Optional[Dict[str, Any]]:
-    """
-    Fetch full issue JSON (first path that returns !404). Returns dict or None.
-    """
-    if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
-        return None
-
-    paths = [
-        f"/api/v1/issue/{issue_id}",
-        f"/api/v1/issues/{issue_id}",
-    ]
-    async with httpx.AsyncClient(timeout=20) as c:
-        for p in paths:
-            try:
-                r = await c.get(f"{_base()}{p}", headers=_headers())
-                if r.status_code == 404:
-                    continue
-                r.raise_for_status()
-                return r.json()
-            except httpx.HTTPStatusError as e:
-                if e.response is not None and e.response.status_code == 404:
-                    continue
-                log.info("jelly_fetch_issue HTTP error %s: %s", p, e)
-            except Exception as e:
-                log.info("jelly_fetch_issue error %s: %s", p, e)
-    return None

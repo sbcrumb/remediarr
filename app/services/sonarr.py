@@ -1,105 +1,157 @@
-import asyncio
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+
 import httpx
-from typing import Any, Dict, List, Optional, Tuple
 
-from app.config import SONARR_URL, SONARR_API_KEY
-from app.http import retry_http
-
-
-def _params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    base = {"apikey": SONARR_API_KEY}
-    if extra:
-        base.update(extra)
-    return base
+from app.config import cfg
+from app.logging import log
 
 
-async def get_system_status() -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{SONARR_URL}/api/v3/system/status", params=_params())
-        r.raise_for_status()
-        return r.json()
+def _base() -> str:
+    return cfg.SONARR_URL.rstrip("/")
 
 
-async def get_series_by_tvdb(tvdb_id: int) -> Optional[Dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{SONARR_URL}/api/v3/series", params=_params({"tvdbId": tvdb_id}))
-        r.raise_for_status()
-        items = r.json()
-        return items[0] if isinstance(items, list) and items else None
+def _headers() -> Dict[str, str]:
+    return {"X-Api-Key": cfg.SONARR_API_KEY}
 
 
-async def find_episode(series_id: int, season: int, episode: int) -> Optional[Dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(
-            f"{SONARR_URL}/api/v3/episode",
-            params=_params({"seriesId": series_id, "seasonNumber": season}),
-        )
-        r.raise_for_status()
-        for ep in r.json():
-            if int(ep.get("episodeNumber", -1)) == int(episode):
-                return ep
+async def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.SONARR_HTTP_TIMEOUT) as c:
+            r = await c.get(url, headers=_headers(), params=params)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        log.info("Sonarr GET %s failed: %s", path, e)
         return None
 
 
-async def delete_episode_file(episode_file_id: int) -> None:
-    async with httpx.AsyncClient(timeout=30) as c:
-        async def _do():
-            return await c.delete(f"{SONARR_URL}/api/v3/episodefile/{episode_file_id}", params=_params())
-        await retry_http(_do, what=f"sonarr delete episodefile {episode_file_id}")
+async def _post_json(path: str, json: Dict[str, Any]) -> Optional[Any]:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.SONARR_HTTP_TIMEOUT) as c:
+            r = await c.post(url, headers=_headers(), json=json)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        log.info("Sonarr POST %s failed: %s", path, e)
+        return None
 
 
-async def episode_search(episode_id: int) -> None:
-    payload = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
-    async with httpx.AsyncClient(timeout=30) as c:
-        async def _do():
-            return await c.post(f"{SONARR_URL}/api/v3/command", params=_params(), json=payload)
-        await retry_http(_do, what=f"sonarr EpisodeSearch episodeId={episode_id}")
-
-
-async def queue_contains_episode(episode_id: int) -> bool:
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{SONARR_URL}/api/v3/queue", params=_params({"page": 1, "pageSize": 100}))
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("records") if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            return False
-        for it in items:
-            # Sonarr queue items have episodeId inside nested "episode" or direct key (depends on version)
-            ep = it.get("episode") or {}
-            if int(ep.get("id", it.get("episodeId", -1))) == int(episode_id):
-                return True
+async def _delete(path: str) -> bool:
+    url = f"{_base()}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=cfg.SONARR_HTTP_TIMEOUT) as c:
+            r = await c.delete(url, headers=_headers())
+            return r.status_code in (200, 202, 204)
+    except Exception as e:
+        log.info("Sonarr DELETE %s failed: %s", path, e)
         return False
 
 
-async def wait_until_episode_queued(episode_id: int, timeout_sec: int = 25, poll_sec: float = 2.0) -> bool:
-    total = 0.0
-    while total < timeout_sec:
-        if await queue_contains_episode(episode_id):
+async def get_series_by_tvdb(tvdb_id: int) -> Optional[Dict[str, Any]]:
+    data = await _get_json("/api/v3/series", params={"tvdbId": tvdb_id})
+    if isinstance(data, list) and data:
+        return data[0]
+    return None
+
+
+async def get_series_by_imdb(imdb_id: str) -> Optional[Dict[str, Any]]:
+    lookup = await _get_json("/api/v3/series/lookup", params={"term": f"imdb:{imdb_id}"})
+    tvdb = None
+    if isinstance(lookup, list) and lookup:
+        tvdb = lookup[0].get("tvdbId")
+    if tvdb:
+        return await get_series_by_tvdb(tvdb)
+    return None
+
+
+async def get_series_by_title(term: str) -> Optional[Dict[str, Any]]:
+    lookup = await _get_json("/api/v3/series/lookup", params={"term": term})
+    if isinstance(lookup, list) and lookup:
+        tvdb = lookup[0].get("tvdbId")
+        if tvdb:
+            return await get_series_by_tvdb(tvdb)
+    return None
+
+
+async def find_episode_ids(series_id: int, season: Optional[int], episode: Optional[int]) -> List[int]:
+    """Return episode IDs to act on. If season/episode missing, returns ALL episodes with files."""
+    eps = await _get_json("/api/v3/episode", params={"seriesId": series_id})
+    if not isinstance(eps, list):
+        return []
+    ids: List[int] = []
+    for e in eps:
+        if season is not None and e.get("seasonNumber") != season:
+            continue
+        if episode is not None and e.get("episodeNumber") != episode:
+            continue
+        # include only episodes that currently have a file
+        if e.get("hasFile") and e.get("id"):
+            ids.append(int(e["id"]))
+    # If nothing specific selected but season/episode not provided, nuke all with files
+    if not ids and season is None and episode is None:
+        ids = [int(e["id"]) for e in eps if e.get("hasFile") and e.get("id")]
+    return ids
+
+
+async def delete_episodefiles_by_episode_ids(episode_ids: List[int]) -> int:
+    """Delete episode files for given episode IDs (episodeFileId is on episode resource)."""
+    if not episode_ids:
+        return 0
+    eps = await _get_json("/api/v3/episode", params={"episodeIds": ",".join(map(str, episode_ids))})
+    if not isinstance(eps, list):
+        return 0
+    deleted = 0
+    for e in eps:
+        efid = e.get("episodeFileId")
+        if efid:
+            if await _delete(f"/api/v3/episodefile/{efid}"):
+                deleted += 1
+    return deleted
+
+
+async def search_series(series_id: int) -> bool:
+    cmd = {"name": "SeriesSearch", "seriesId": series_id}
+    return bool(await _post_json("/api/v3/command", cmd))
+
+
+async def queue_has_series(series_id: int) -> bool:
+    q = await _get_json("/api/v3/queue", params={"pageSize": 50})
+    if isinstance(q, dict):
+        items = q.get("records") or q.get("results") or []
+    else:
+        items = q if isinstance(q, list) else []
+    for it in items:
+        if int(it.get("seriesId") or 0) == int(series_id):
             return True
-        await asyncio.sleep(poll_sec)
-        total += poll_sec
     return False
 
 
-async def delete_and_search_episode(series_id: int, season: int, episode: int) -> Tuple[bool, bool, Optional[int]]:
-    """
-    If the episode has a file, delete it; trigger a search.
-    Returns (deleted_file, queued_now, episode_id)
-    """
-    ep = await find_episode(series_id, season, episode)
-    if not ep:
-        return False, False, None
-
-    deleted = False
-    ep_file_id = ep.get("episodeFileId")
-    if ep_file_id:
+async def history_has_recent_grab(series_id: int, window_seconds: int) -> bool:
+    params = {"eventType": "grabbed", "seriesId": series_id, "pageSize": 20, "page": 1}
+    hist = await _get_json("/api/v3/history", params=params)
+    now = datetime.now(timezone.utc)
+    items = []
+    if isinstance(hist, dict):
+        items = hist.get("records") or hist.get("results") or []
+    elif isinstance(hist, list):
+        items = hist
+    for h in items:
+        ds = h.get("date") or h.get("eventDate") or h.get("updated")
+        if not ds:
+            continue
         try:
-            await delete_episode_file(int(ep_file_id))
-            deleted = True
+            ts = datetime.fromisoformat(ds.replace("Z", "+00:00"))
         except Exception:
-            pass
-
-    await episode_search(int(ep["id"]))
-    queued = await wait_until_episode_queued(int(ep["id"]))
-    return deleted, queued, int(ep["id"])
+            continue
+        if now - ts <= timedelta(seconds=window_seconds):
+            return True
+    return False
