@@ -7,15 +7,14 @@
 
 import os
 import logging
-from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
+from typing import Tuple, Dict, Any
 
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-# Mount your webhook routes
-from webhooks.router import router as jellyseerr_router  # ensures /webhook/jellyseerr is live
+# NOTE: use the package-qualified import because this module is inside the "app" package.
+from app.webhooks.router import router as jellyseerr_router  # POST /webhook/jellyseerr
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -49,12 +48,12 @@ app = FastAPI(title="Remediarr")
 
 def _read_version() -> str:
     """
-    Resolve version from env (APP_VERSION or VERSION) or /app/VERSION fallback.
+    Resolve version from env (APP_VERSION or VERSION) or VERSION file fallback.
     """
     v = os.getenv("APP_VERSION") or os.getenv("VERSION")
     if v:
         return v.strip()
-    for p in ("./VERSION", "/app/VERSION"):  # support local run & container
+    for p in ("./VERSION", "/app/VERSION"):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 return f.read().strip()
