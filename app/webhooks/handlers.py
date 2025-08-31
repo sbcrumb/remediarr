@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Iterable
 
 from fastapi import HTTPException
 
@@ -86,8 +86,38 @@ def _gather_text_for_keywords(payload: Dict[str, Any]) -> str:
     return " ".join([title, desc, ctext]).strip()
 
 
-def _split_keywords(s: str) -> set[str]:
-    return {kw.strip().lower() for kw in (s or "").split(",") if kw.strip()}
+def _split_keywords(s: str) -> list[str]:
+    return [kw.strip().lower() for kw in (s or "").split(",") if kw.strip()]
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    seen, out = set(), []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+
+def _keywords_for_media(media_type: str) -> list[str]:
+    """Return the configured keyword list for the given media type, de-duplicated, order-preserving."""
+    if media_type == "series":
+        buckets = [
+            _split_keywords(cfg.TV_AUDIO_KEYWORDS),
+            _split_keywords(cfg.TV_VIDEO_KEYWORDS),
+            _split_keywords(cfg.TV_SUBTITLE_KEYWORDS),
+            _split_keywords(cfg.TV_OTHER_KEYWORDS),
+        ]
+    else:
+        buckets = [
+            _split_keywords(cfg.MOVIE_AUDIO_KEYWORDS),
+            _split_keywords(cfg.MOVIE_VIDEO_KEYWORDS),
+            _split_keywords(cfg.MOVIE_SUBTITLE_KEYWORDS),
+            _split_keywords(cfg.MOVIE_WRONG_KEYWORDS),
+            _split_keywords(cfg.MOVIE_OTHER_KEYWORDS),
+        ]
+    flat: list[str] = [kw for bucket in buckets for kw in bucket]
+    return _dedupe_preserve_order(flat)
 
 
 def _match_bucket(media_type: str, text: str) -> Optional[str]:
@@ -129,7 +159,6 @@ async def _already_posted_same(issue_id: Optional[int], intended_msg_prefixed: s
         if not isinstance(issue, dict):
             return False
         comments = issue.get("comments") or issue.get("activity") or []
-        # comments may be newest-last or newest-first; just scan a few
         for c in (list(comments)[-5:] if isinstance(comments, list) else []):
             text = (c.get("message") or c.get("text") or "").strip()
             if text and text.strip() == intended_msg_prefixed.strip():
@@ -161,11 +190,20 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
         return {"found": False, "acted": False}
 
     series_id = int(series["id"])
+    all_kws = _keywords_for_media("series")
+    kws_text = ", ".join(all_kws) if all_kws else "no keywords configured"
 
     # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
-            coach = cfg.MSG_KEYWORD_COACH or "Tip: include one of the auto-fix keywords next time so I can repair this automatically."
+            # If user provided a template, let it render; otherwise include the keyword list.
+            template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
+            coach = template.format(
+                title=title or series.get("title") or "Unknown",
+                season=season or 0,
+                episode=episode or 0,
+                keywords=kws_text,
+            )
             coach_pref = _ensure_prefixed(coach)
             if not await _already_posted_same(issue_id, coach_pref):
                 await jelly_comment(issue_id, coach_pref)
@@ -190,11 +228,23 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
     # Success comment
     if ok and issue_id:
         if season is not None and episode is not None:
-            msg = cfg.MSG_TV_REPLACED_AND_GRABBED or "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue."
-            msg = msg.format(title=title or series.get("title") or "Unknown", season=season or 0, episode=episode or 0)
+            msg = (cfg.MSG_TV_REPLACED_AND_GRABBED or
+                   "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue.")
+            msg = msg.format(
+                title=title or series.get("title") or "Unknown",
+                season=season or 0,
+                episode=episode or 0,
+                keywords=kws_text,
+            )
         else:
-            msg = cfg.MSG_TV_SEARCH_ONLY_GRABBED or "{title}: new downloads are being grabbed. Closing this issue."
-            msg = msg.format(title=title or series.get("title") or "Unknown", season=0, episode=0)
+            msg = (cfg.MSG_TV_SEARCH_ONLY_GRABBED or
+                   "{title}: new downloads are being grabbed. Closing this issue.")
+            msg = msg.format(
+                title=title or series.get("title") or "Unknown",
+                season=0,
+                episode=0,
+                keywords=kws_text,
+            )
         await jelly_comment(issue_id, _ensure_prefixed(msg))
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
@@ -202,8 +252,14 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
 
     # Couldn’t verify
     if issue_id:
-        fail = cfg.MSG_AUTOCLOSE_FAIL or "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it."
-        await jelly_comment(issue_id, _ensure_prefixed(fail))
+        fail = (cfg.MSG_AUTOCLOSE_FAIL or
+                "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
+        await jelly_comment(issue_id, _ensure_prefixed(fail.format(
+            title=title or series.get("title") or "Unknown",
+            season=season or 0,
+            episode=episode or 0,
+            keywords=kws_text,
+        )))
     return {"found": True, "acted": True, "seriesId": series_id, "queued": False}
 
 
@@ -225,11 +281,19 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
         return {"found": False, "acted": False}
 
     movie_id = int(movie["id"])
+    all_kws = _keywords_for_media("movie")
+    kws_text = ", ".join(all_kws) if all_kws else "no keywords configured"
 
     # No keywords? Coach and exit (but only once).
     if not bucket:
         if issue_id:
-            coach = cfg.MSG_KEYWORD_COACH or "Tip: include one of the auto-fix keywords next time so I can repair this automatically."
+            template = cfg.MSG_KEYWORD_COACH or "Tip: include one of these keywords next time so I can repair this automatically: {keywords}."
+            coach = template.format(
+                title=title or movie.get("title") or "Unknown",
+                season=0,
+                episode=0,
+                keywords=kws_text,
+            )
             coach_pref = _ensure_prefixed(coach)
             if not await _already_posted_same(issue_id, coach_pref):
                 await jelly_comment(issue_id, coach_pref)
@@ -251,16 +315,28 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
          await _poll_until(queue_pred, cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
-        msg = cfg.MSG_MOVIE_REPLACED_AND_GRABBED or "{title}: replaced file; new download grabbed. Closing this issue."
-        msg = msg.format(title=title or movie.get("title") or "Unknown")
+        msg = (cfg.MSG_MOVIE_REPLACED_AND_GRABBED or
+               "{title}: replaced file; new download grabbed. Closing this issue.")
+        msg = msg.format(
+            title=title or movie.get("title") or "Unknown",
+            season=0,
+            episode=0,
+            keywords=kws_text,
+        )
         await jelly_comment(issue_id, _ensure_prefixed(msg))
         if cfg.CLOSE_JELLYSEERR_ISSUES:
             await jelly_close(issue_id)
         return {"found": True, "acted": True, "movieId": movie_id, "queued": True}
 
     if issue_id:
-        fail = cfg.MSG_AUTOCLOSE_FAIL or "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it."
-        await jelly_comment(issue_id, _ensure_prefixed(fail))
+        fail = (cfg.MSG_AUTOCLOSE_FAIL or
+                "Action completed but I couldn’t verify a new grab in time. Please keep an eye on it.")
+        await jelly_comment(issue_id, _ensure_prefixed(fail.format(
+            title=title or movie.get("title") or "Unknown",
+            season=0,
+            episode=0,
+            keywords=kws_text,
+        )))
     return {"found": True, "acted": True, "movieId": movie_id, "queued": False}
 
 
@@ -270,7 +346,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # We ignore our own comments regardless of the event name/string.
+    # Ignore our own comments regardless of event string.
     comment = payload.get("comment") or {}
     comment_text = (comment.get("text") or comment.get("message") or "").strip()
     if comment_text and is_our_comment(comment_text):
