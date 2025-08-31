@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,10 +10,32 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BOT_PREFIX = "[Remediarr]"
 
 
+def _detect_version() -> str:
+    """
+    Priority:
+      1) REMEDIARR_VERSION env (e.g., dev-<sha> baked at build time)
+      2) VERSION file at repo root (release/main builds)
+      3) fallback 'dev'
+    NOTE: We do NOT call `git` at runtime (containers often lack .git).
+    """
+    env_v = os.getenv("REMEDIARR_VERSION")
+    if env_v and env_v.strip():
+        return env_v.strip()
+
+    # repo root is two levels up from this file: app/config.py -> app/ -> repo/
+    vf = Path(__file__).resolve().parents[1] / "VERSION"
+    if vf.exists():
+        vtxt = vf.read_text(encoding="utf-8").strip()
+        if vtxt:
+            return vtxt
+
+    return "dev"
+
+
 class Settings(BaseSettings):
     # ===== App / Server =====
     APP_NAME: str = "Remediarr"
-    VERSION: str = os.getenv("REMEDIARR_VERSION", "0.3.0")
+    VERSION: str = _detect_version()
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     APP_HOST: str = os.getenv("APP_HOST", "0.0.0.0")
     APP_PORT: int = int(os.getenv("APP_PORT", "8189"))
@@ -35,7 +58,7 @@ class Settings(BaseSettings):
     JELLYSEERR_API_KEY: str
 
     # ===== Behavior toggles =====
-    ENABLE_BLOCKLIST: bool = True   # (placeholder – not used here)
+    ENABLE_BLOCKLIST: bool = True
     CLOSE_JELLYSEERR_ISSUES: bool = True
     ACK_ON_COMMENT_CREATED: bool = True
 
