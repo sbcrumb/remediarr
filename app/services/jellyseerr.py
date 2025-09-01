@@ -75,27 +75,45 @@ async def jelly_comment(issue_id: int, text: str) -> None:
     r = await _client_lazy().post(url, headers=_headers, json=body)
     r.raise_for_status()
 
-async def jelly_close(issue_id: int) -> None:
+async def jelly_close(issue_id: int) -> bool:
     """Resolve/close issue using multiple fallbacks (different Jellyseerr builds vary)."""
+    if not (BASE and API_KEY):
+        log.warning("Cannot close issue %s: missing Jellyseerr config", issue_id)
+        return False
+        
     client = _client_lazy()
-    tried = []
+    
+    # Try different endpoints that various Jellyseerr/Overseerr versions support
+    endpoints = [
+        # Most common working endpoint
+        ("POST", f"/api/v1/issue/{issue_id}/resolve", {}),
+        # Alternative endpoints to try
+        ("PATCH", f"/api/v1/issue/{issue_id}", {"status": "resolved"}),
+        ("PUT", f"/api/v1/issue/{issue_id}", {"status": "resolved"}),
+        ("POST", f"/api/v1/issue/{issue_id}/resolved", {}),
+        ("PATCH", f"/api/v1/issue/{issue_id}", {"status": 2}),  # numeric status
+        ("PUT", f"/api/v1/issue/{issue_id}/status", {"status": "resolved"}),
+    ]
 
-    # 1) Likely UI endpoint
-    url1 = f"{BASE}/api/v1/issue/{issue_id}/resolve"
-    tried.append(url1)
-    r = await client.post(url1, headers=_headers)
-    if r.status_code in (200, 204):
-        return
-    # 2) PATCH status-style
-    url2 = f"{BASE}/api/v1/issue/{issue_id}"
-    tried.append(url2)
-    r2 = await client.patch(url2, headers=_headers, json={"status": "resolved"})
-    if r2.status_code in (200, 204):
-        return
-    # 3) numeric status fallback
-    r3 = await client.patch(url2, headers=_headers, json={"status": 2})
-    if r3.status_code in (200, 204):
-        return
+    for method, path, json_data in endpoints:
+        try:
+            url = f"{BASE}{path}"
+            log.info("Attempting to close issue %s: %s %s", issue_id, method, path)
+            
+            if json_data:
+                r = await client.request(method, url, headers=_headers, json=json_data)
+            else:
+                r = await client.request(method, url, headers=_headers)
+                
+            log.info("Close attempt result: %s %s -> %s", method, path, r.status_code)
+            
+            if r.status_code in (200, 201, 204):
+                log.info("Successfully closed issue %s using %s %s", issue_id, method, path)
+                return True
+                
+        except Exception as e:
+            log.info("Close attempt failed %s %s: %s", method, path, e)
+            continue
 
-    log.warning("Jellyseerr: could not resolve issue %s (tried: %s). Last status=%s/%s/%s",
-                issue_id, ", ".join(tried), r.status_code, r2.status_code, r3.status_code)
+    log.warning("All close attempts failed for issue %s", issue_id)
+    return False

@@ -127,28 +127,35 @@ async def _verify_radarr_and_close(issue_id: int, movie: Dict[str, Any], removed
     log.info("Triggering search for movie %s", movie_id)
     await R.trigger_search_movie(movie_id)
     
+    # Give it a moment for the search to register before polling
+    await asyncio.sleep(3)
+    
     # Wait/poll for a *new* grabbed after baseline
     total = RADARR_VERIFY_GRAB_SEC
-    step = max(2, RADARR_VERIFY_POLL_SEC)
-    waited = 0
+    step = max(3, RADARR_VERIFY_POLL_SEC)
+    waited = 3  # Already waited 3 seconds above
+    
     while waited < total:
-        if await R.has_new_grab_since(movie_id, baseline):
+        new_grab = await R.has_new_grab_since(movie_id, baseline)
+        log.info("Movie %s grab check: waited=%ds, new_grab=%s", movie_id, waited, new_grab)
+        
+        if new_grab:
             # Success → one closing comment + resolve
             msg = (MSG_MOVIE_REPLACED_AND_GRABBED if removed_count > 0 else MSG_MOVIE_SEARCH_ONLY_GRABBED).format(
                 title=title)
             if COMMENT_ON_ACTION:
                 await jelly_comment(issue_id, f"{PREFIX} {msg}")
             if CLOSE_ISSUES:
-                await jelly_close(issue_id)
-            await notify(f"Remediarr - Movie Fixed", f"{PREFIX} {msg}")
+                closed = await jelly_close(issue_id)
+                log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+            await notify(f"Remediarr - Movie Fixed", f"{msg}")
             return
+            
         await asyncio.sleep(step)
         waited += step
     
     log.info("Radarr verify window elapsed (no new grab). Not closing issue %s.", issue_id)
-    # Still comment that we tried
-    if COMMENT_ON_ACTION:
-        await jelly_comment(issue_id, f"{PREFIX} {title}: triggered search but no new download yet. Please check back later.")
+    # Don't comment on timeout - let the user know the search was triggered but wait longer
 
 async def _verify_sonarr_and_close(issue_id: int, series: Dict[str, Any], season: int, episode: int, removed_count: int, episode_ids: List[int]) -> None:
     sid = series["id"]
