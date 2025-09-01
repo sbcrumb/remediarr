@@ -19,8 +19,9 @@ PREFIX = os.getenv("JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
 CLOSE_ISSUES = os.getenv("JELLYSEERR_CLOSE_ISSUES", "true").lower() == "true"
 COMMENT_ON_ACTION = os.getenv("JELLYSEERR_COMMENT_ON_ACTION", "true").lower() == "true"
 
-# Messages - Simple and clean
-MSG_SUCCESS = os.getenv("MSG_SUCCESS", "closed")
+# Messages - Your requested format
+MSG_MOVIE_SUCCESS = os.getenv("MSG_MOVIE_SUCCESS", "{title}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass.")
+MSG_TV_SUCCESS = os.getenv("MSG_TV_SUCCESS", "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass.")
 
 # Keyword buckets (lower-cased sets)
 def _csv(name: str) -> List[str]:
@@ -299,15 +300,15 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
     log.info("Triggering search for movie %s", movie_id)
     await R.trigger_search_movie(movie_id)
     
-    # Trust it worked - comment and close immediately
-    msg = MSG_SUCCESS
+    # Comment and close
+    msg = MSG_MOVIE_SUCCESS.format(title=title)
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
     
-    await notify(f"Remediarr - Movie", f"{title}: {msg}")
+    await notify(f"Remediarr - Movie", f"{title}: fixed")
 
 async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str) -> None:
     series_id = series["id"]
@@ -324,15 +325,15 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     log.info("Triggering search for series %s episodes %s", series_id, episode_ids)
     await S.trigger_episode_search(episode_ids)
     
-    # Trust it worked - comment and close immediately
-    msg = MSG_SUCCESS
+    # Comment and close
+    msg = MSG_TV_SUCCESS.format(title=title, season=season, episode=episode)
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
     
-    await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: {msg}")
+    await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: fixed")
 
 async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Main webhook entry. We always fetch the issue to normalize fields."""
