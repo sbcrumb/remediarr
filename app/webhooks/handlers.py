@@ -228,12 +228,30 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Last comment is ours; skipping.")
         return {"ok": True, "detail": "ignored: our comment"}
 
-    # If S/E still missing for TV, try parse from comment text
+    # If S/E still missing for TV, try multiple extraction methods
     if media_type in ("tv", "series") and (not season or not episode):
+        # Try parsing from the last comment
         s, e = _parse_se_from_text(last)
         if s and e:
             season, episode = s, e
             log.info("Parsed S/E from comment: S%02dE%02d", season, episode)
+        else:
+            # Try parsing from issue title/description
+            issue_desc = issue.get("issueType") or ""
+            issue_title = str(payload.get("subject") or "")
+            s2, e2 = _parse_se_from_text(f"{issue_title} {issue_desc}")
+            if s2 and e2:
+                season, episode = s2, e2
+                log.info("Parsed S/E from issue title/desc: S%02dE%02d", season, episode)
+            else:
+                # Last resort: check if there's episode info buried in the issue object
+                for key in ["episodeNumber", "episode_number", "ep", "seasonNumber", "season_number"]:
+                    if not episode and issue.get(key):
+                        episode = issue.get(key)
+                    if not season and key.startswith("season") and issue.get(key):
+                        season = issue.get(key)
+                if season and episode:
+                    log.info("Found S/E in issue object: S%02dE%02d", season, episode)
 
     # Bucket
     bucket = _bucket_for(last, media_type)
@@ -274,9 +292,21 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # === TV ===
     elif media_type in ("tv", "series"):
-        if not (tvdb and season and episode):
-            log.info("Series missing season/episode or tvdb; not acting to avoid season-wide search.")
-            return {"ok": True, "detail": "ignored: insufficient TV context"}
+        # Parse season/episode more aggressively for TV
+        if not (season and episode):
+            log.info("TV issue missing season/episode info. Available data: season=%s, episode=%s", season, episode)
+            log.info("You need to either:")
+            log.info("1. Include season/episode in the Jellyseerr issue when creating it")
+            log.info("2. Add 'S01E05' format to your comment (e.g., 'S01E05 no video')")
+            log.info("3. Ensure Jellyseerr is configured to include affected season/episode in webhooks")
+            return {"ok": True, "detail": "ignored: TV missing season/episode - add S##E## to comment"}
+
+        # Convert to int if they're strings
+        try:
+            season = int(season)
+            episode = int(episode)
+        except (ValueError, TypeError):
+            return {"ok": True, "detail": "ignored: invalid season/episode format"}
 
         series = await S.get_series_by_tvdb(int(tvdb))
         if not series:
