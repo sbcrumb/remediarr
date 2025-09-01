@@ -86,7 +86,128 @@ def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     
     return None
 
-_sxxexx = re.compile(r"[sS](\d{1,2})[ .-]*[eE](\d{1,2})")
+def _to_int_or_none(val) -> Optional[int]:
+    try:
+        if isinstance(val, bool):
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            return int(val)
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("{{") and s.endswith("}}"):
+                return None
+            m = re.search(r"\d+", s)
+            return int(m.group()) if m else None
+    except Exception:
+        return None
+    return None
+
+def _key_looks_like(name: str, want: str) -> bool:
+    n = name.lower()
+    if want == "season":
+        return ("season" in n) and ("reason" not in n)
+    if want == "episode":
+        return "episode" in n
+    return False
+
+def _maybe_int_from_obj(v: Any) -> Optional[int]:
+    if isinstance(v, dict):
+        for _, v2 in v.items():
+            iv = _to_int_or_none(v2)
+            if iv is not None:
+                return iv
+    return _to_int_or_none(v)
+
+def _walk_for_season_episode(o: Any) -> Tuple[Optional[int], Optional[int]]:
+    s_found: Optional[int] = None
+    e_found: Optional[int] = None
+    def _walk(node: Any):
+        nonlocal s_found, e_found
+        if node is None or (s_found is not None and e_found is not None):
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if s_found is None and _key_looks_like(k, "season"):
+                    sv = _maybe_int_from_obj(v)
+                    s_found = sv if sv is not None else s_found
+                if e_found is None and _key_looks_like(k, "episode"):
+                    ev = _maybe_int_from_obj(v)
+                    e_found = ev if ev is not None else e_found
+                _walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                _walk(it)
+    _walk(o)
+    return s_found, e_found
+
+def _extract_season_episode_from_text(text: str) -> Tuple[Optional[int], Optional[int]]:
+    m = re.search(r"[Ss](\d{1,3})[Ee](\d{1,3})", text or "")
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    sm = re.search(r"Season\s+(\d{1,3})", text or "", re.IGNORECASE)
+    em = re.search(r"Episode\s+(\d{1,3})", text or "", re.IGNORECASE)
+    return (int(sm.group(1)) if sm else None, int(em.group(1)) if em else None)
+
+async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
+    issue = payload.get("issue") or {}
+    media = payload.get("media") or {}
+    comment = payload.get("comment") or {}
+
+    tvdb_id = media.get("tvdbId") or media.get("tvdbid")
+    if not tvdb_id:
+        raise ValueError("Missing tvdbId")
+
+    # Try explicit keys first
+    c_s = [media.get("seasonNumber"), media.get("season"),
+           issue.get("affected_season"), issue.get("affectedSeason"), issue.get("season")]
+    c_e = [media.get("episodeNumber"), media.get("episode"),
+           issue.get("affected_episode"), issue.get("affectedEpisode"), issue.get("episode")]
+    season = next((v for v in (_to_int_or_none(x) for x in c_s) if v is not None), None)
+    episode = next((v for v in (_to_int_or_none(x) for x in c_e) if v is not None), None)
+
+    # Fallback: parse from text
+    if season is None or episode is None:
+        text = " ".join([
+            str(payload.get("subject") or ""),
+            str(issue.get("issue_type") or ""),
+            str(issue.get("issue_status") or ""),
+            str(payload.get("message") or ""),
+            str(comment.get("comment_message") or ""),
+            str(comment.get("message") or "")
+        ])
+        s2, e2 = _extract_season_episode_from_text(text)
+        season = season if season is not None else s2
+        episode = episode if episode is not None else e2
+
+    # Fallback: walk the entire payload for season/episode
+    if season is None or episode is None:
+        s3, e3 = _walk_for_season_episode(payload)
+        season = season if season is not None else s3
+        episode = episode if episode is not None else e3
+
+    # Final fallback: fetch issue from Jellyseerr API
+    if (season is None or episode is None) and issue.get("issue_id"):
+        try:
+            full_issue = await jelly_fetch_issue(int(issue.get("issue_id")))
+            s4, e4 = _walk_for_season_episode(full_issue)
+            season = season if season is not None else s4
+            episode = episode if episode is not None else e4
+            if season and episode:
+                log.info("Found S/E from Jellyseerr API: S%02dE%02d", season, episode)
+        except Exception as e:
+            log.warning("Failed to fetch issue details: %s", e)
+
+    # Get series from Sonarr
+    series = await S.get_series_by_tvdb(int(tvdb_id))
+    if not series:
+        raise ValueError("Series not found in Sonarr")
+    
+    if season is None or episode is None:
+        raise ValueError(f"Missing season/episode after all extraction attempts: S{season}E{episode}")
+    
+    return series["id"], series, int(season), int(episode)
 
 def _parse_se_from_text(text: str) -> Tuple[Optional[int], Optional[int]]:
     m = _sxxexx.search(text or "")
@@ -206,19 +327,23 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     log.info("Processing issue %s", issue_id)
 
-    # Fetch the full issue details
+    # Fetch the full issue details and merge with payload
     issue = await jelly_fetch_issue(issue_id)
     
-    # Extract canonical context from fetched issue
-    media = issue.get("media") or {}
+    # Create enriched payload with both original payload and fetched issue data
+    enriched_payload = {
+        **payload,
+        "issue": {**(payload.get("issue") or {}), **issue},
+        "media": {**(payload.get("media") or {}), **(issue.get("media") or {})},
+    }
+    
+    # Extract canonical context from enriched data
+    media = enriched_payload.get("media") or {}
     media_type = (media.get("mediaType") or media.get("type") or "").lower()
     tmdb = media.get("tmdbId")
     tvdb = media.get("tvdbId")
-    season = issue.get("affectedSeason")
-    episode = issue.get("affectedEpisode")
 
-    log.info("Issue context: media_type=%s, tmdb=%s, tvdb=%s, season=%s, episode=%s", 
-             media_type, tmdb, tvdb, season, episode)
+    log.info("Issue context: media_type=%s, tmdb=%s, tvdb=%s", media_type, tmdb, tvdb)
 
     # Last human comment & bucket
     last = await jelly_last_human_comment(issue_id)
@@ -227,31 +352,6 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     if is_our_comment(last):
         log.info("Last comment is ours; skipping.")
         return {"ok": True, "detail": "ignored: our comment"}
-
-    # If S/E still missing for TV, try multiple extraction methods
-    if media_type in ("tv", "series") and (not season or not episode):
-        # Try parsing from the last comment
-        s, e = _parse_se_from_text(last)
-        if s and e:
-            season, episode = s, e
-            log.info("Parsed S/E from comment: S%02dE%02d", season, episode)
-        else:
-            # Try parsing from issue title/description
-            issue_desc = issue.get("issueType") or ""
-            issue_title = str(payload.get("subject") or "")
-            s2, e2 = _parse_se_from_text(f"{issue_title} {issue_desc}")
-            if s2 and e2:
-                season, episode = s2, e2
-                log.info("Parsed S/E from issue title/desc: S%02dE%02d", season, episode)
-            else:
-                # Last resort: check if there's episode info buried in the issue object
-                for key in ["episodeNumber", "episode_number", "ep", "seasonNumber", "season_number"]:
-                    if not episode and issue.get(key):
-                        episode = issue.get(key)
-                    if not season and key.startswith("season") and issue.get(key):
-                        season = issue.get(key)
-                if season and episode:
-                    log.info("Found S/E in issue object: S%02dE%02d", season, episode)
 
     # Bucket
     bucket = _bucket_for(last, media_type)
@@ -292,43 +392,34 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # === TV ===
     elif media_type in ("tv", "series"):
-        # Parse season/episode more aggressively for TV
-        if not (season and episode):
-            log.info("TV issue missing season/episode info. Available data: season=%s, episode=%s", season, episode)
-            log.info("You need to either:")
-            log.info("1. Include season/episode in the Jellyseerr issue when creating it")
-            log.info("2. Add 'S01E05' format to your comment (e.g., 'S01E05 no video')")
-            log.info("3. Ensure Jellyseerr is configured to include affected season/episode in webhooks")
-            return {"ok": True, "detail": "ignored: TV missing season/episode - add S##E## to comment"}
+        if not tvdb:
+            log.info("TV issue missing tvdbId; skipping.")
+            return {"ok": True, "detail": "ignored: missing tvdb id"}
 
-        # Convert to int if they're strings
         try:
-            season = int(season)
-            episode = int(episode)
-        except (ValueError, TypeError):
-            return {"ok": True, "detail": "ignored: invalid season/episode format"}
+            # Use the robust extraction method from original app.py with enriched payload
+            series_id, series, season, episode = await _tv_episode_from_payload(enriched_payload)
+            log.info("Successfully extracted TV context: series_id=%s, S%02dE%02d", series_id, season, episode)
+        except (ValueError, Exception) as e:
+            log.info("TV extraction failed: %s", str(e))
+            return {"ok": True, "detail": f"ignored: {str(e)}"}
 
-        series = await S.get_series_by_tvdb(int(tvdb))
-        if not series:
-            log.info("Sonarr: series not found for tvdb=%s", tvdb)
-            return {"ok": True, "detail": "ignored: series not in sonarr"}
-
-        episode_ids = await S.episode_ids_for(series["id"], int(season), int(episode))
+        episode_ids = await S.episode_ids_for(series_id, season, episode)
         if not episode_ids:
-            log.info("Sonarr: no episode ids for S%02dE%02d", int(season), int(episode))
+            log.info("Sonarr: no episode ids for S%02dE%02d", season, episode)
             return {"ok": True, "detail": "ignored: episode not present"}
 
         log.info("Processing TV series %s (%s) S%02dE%02d with bucket: %s", 
-                 series["id"], series.get("title"), season, episode, bucket)
+                 series_id, series.get("title"), season, episode, bucket)
 
         removed = 0
         if bucket in ("audio", "video", "subtitle"):
-            log.info("Deleting episode files for series %s, episodes %s", series["id"], episode_ids)
-            removed = await S.delete_episodefiles(series["id"], episode_ids)
+            log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
+            removed = await S.delete_episodefiles(series_id, episode_ids)
             log.info("Deleted %s episode files", removed)
 
         # Start the verification and close process
-        await _verify_sonarr_and_close(issue_id, series, int(season), int(episode), removed, episode_ids)
+        await _verify_sonarr_and_close(issue_id, series, season, episode, removed, episode_ids)
         _bump_cooldown(issue_id)
         return {"ok": True, "detail": f"tv handled: {bucket}", "removed": removed}
 
