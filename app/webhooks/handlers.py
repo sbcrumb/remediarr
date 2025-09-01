@@ -19,11 +19,6 @@ PREFIX = os.getenv("JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
 CLOSE_ISSUES = os.getenv("JELLYSEERR_CLOSE_ISSUES", "true").lower() == "true"
 COMMENT_ON_ACTION = os.getenv("JELLYSEERR_COMMENT_ON_ACTION", "true").lower() == "true"
 
-RADARR_VERIFY_GRAB_SEC = int(os.getenv("RADARR_VERIFY_GRAB_SEC", "60"))
-RADARR_VERIFY_POLL_SEC = int(os.getenv("RADARR_VERIFY_POLL_SEC", "5"))
-SONARR_VERIFY_GRAB_SEC = int(os.getenv("SONARR_VERIFY_GRAB_SEC", "60"))
-SONARR_VERIFY_POLL_SEC = int(os.getenv("SONARR_VERIFY_POLL_SEC", "5"))
-
 # Messages - Simple and clean
 MSG_SUCCESS = os.getenv("MSG_SUCCESS", "closed")
 
@@ -145,6 +140,24 @@ def _extract_season_episode_from_text(text: str) -> Tuple[Optional[int], Optiona
     sm = re.search(r"Season\s+(\d{1,3})", text or "", re.IGNORECASE)
     em = re.search(r"Episode\s+(\d{1,3})", text or "", re.IGNORECASE)
     return (int(sm.group(1)) if sm else None, int(em.group(1)) if em else None)
+
+# In-memory cooldown to avoid loops
+_COOLDOWN: Dict[int, float] = {}
+_COOLDOWN_SEC = int(os.getenv("REMEDIARR_ISSUE_COOLDOWN_SEC", "90"))
+
+def _under_cooldown(issue_id: int) -> bool:
+    import time
+    now = time.time()
+    ts = _COOLDOWN.get(issue_id, 0)
+    if now < ts:
+        rem = int(ts - now)
+        log.info("Issue %s under cooldown (%ss remaining) — skipping.", issue_id, rem)
+        return True
+    return False
+
+def _bump_cooldown(issue_id: int) -> None:
+    import time
+    _COOLDOWN[issue_id] = time.time() + _COOLDOWN_SEC
 
 async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
     issue = payload.get("issue") or {}
@@ -271,107 +284,55 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     
     return series["id"], series, int(season), int(episode)
 
-def _parse_se_from_text(text: str) -> Tuple[Optional[int], Optional[int]]:
-    m = _sxxexx.search(text or "")
-    if not m:
-        return (None, None)
-    try:
-        return (int(m.group(1)), int(m.group(2)))
-    except Exception:
-        return (None, None)
-
-# In-memory cooldown to avoid loops
-_COOLDOWN: Dict[int, float] = {}
-_COOLDOWN_SEC = int(os.getenv("REMEDIARR_ISSUE_COOLDOWN_SEC", "90"))
-
-def _under_cooldown(issue_id: int) -> bool:
-    import time
-    now = time.time()
-    ts = _COOLDOWN.get(issue_id, 0)
-    if now < ts:
-        rem = int(ts - now)
-        log.info("Issue %s under cooldown (%ss remaining) — skipping.", issue_id, rem)
-        return True
-    return False
-
-def _bump_cooldown(issue_id: int) -> None:
-    import time
-    _COOLDOWN[issue_id] = time.time() + _COOLDOWN_SEC
-
-async def _verify_radarr_and_close(issue_id: int, movie: Dict[str, Any], removed_count: int) -> None:
+async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> None:
     movie_id = movie["id"]
-    title = movie.get("title") or movie.get("titleSlug") or f"Movie {movie_id}"
+    title = movie.get("title") or f"Movie {movie_id}"
     
-    # Get baseline before triggering search
-    baseline = await R.latest_grab_timestamp(movie_id)
-    log.info("Movie %s baseline grab timestamp: %s", movie_id, baseline)
-    
+    # Delete files if needed
+    removed = 0
+    if bucket in ("audio", "video", "subtitle", "wrong"):
+        log.info("Deleting movie files for movie %s", movie_id)
+        removed = await R.delete_moviefiles(movie_id)
+        log.info("Deleted %s movie files", removed)
+
     # Trigger search
     log.info("Triggering search for movie %s", movie_id)
     await R.trigger_search_movie(movie_id)
     
-    # Give it a moment for the search to register before polling
-    await asyncio.sleep(3)
+    # Trust it worked - comment and close immediately
+    msg = MSG_SUCCESS
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
     
-    # Wait/poll for a *new* grabbed after baseline
-    total = RADARR_VERIFY_GRAB_SEC
-    step = max(3, RADARR_VERIFY_POLL_SEC)
-    waited = 3  # Already waited 3 seconds above
-    
-    while waited < total:
-        new_grab = await R.has_new_grab_since(movie_id, baseline)
-        log.info("Movie %s grab check: waited=%ds, new_grab=%s", movie_id, waited, new_grab)
-        
-        if new_grab:
-            # Success → one closing comment + resolve
-            msg = (MSG_MOVIE_REPLACED_AND_GRABBED if removed_count > 0 else MSG_MOVIE_SEARCH_ONLY_GRABBED).format(
-                title=title)
-            if COMMENT_ON_ACTION:
-                await jelly_comment(issue_id, f"{PREFIX} {msg}")
-            if CLOSE_ISSUES:
-                closed = await jelly_close(issue_id)
-                log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
-            await notify(f"Remediarr - Movie Fixed", f"{msg}")
-            return
-            
-        await asyncio.sleep(step)
-        waited += step
-    
-    log.info("Radarr verify window elapsed (no new grab). Not closing issue %s.", issue_id)
-    # Don't comment on timeout - let the user know the search was triggered but wait longer
+    await notify(f"Remediarr - Movie", f"{title}: {msg}")
 
-async def _verify_sonarr_and_close(issue_id: int, series: Dict[str, Any], season: int, episode: int, removed_count: int, episode_ids: List[int]) -> None:
-    sid = series["id"]
-    title = series.get("title") or f"Series {sid}"
+async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
     
-    # Get baseline before triggering search
-    baseline = await S.latest_grab_timestamp(sid, episode_ids)
-    log.info("Series %s S%02dE%02d baseline grab timestamp: %s", sid, season, episode, baseline)
+    # Delete files if needed
+    removed = 0
+    if bucket in ("audio", "video", "subtitle"):
+        log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
+        removed = await S.delete_episodefiles(series_id, episode_ids)
+        log.info("Deleted %s episode files", removed)
 
     # Trigger search
-    log.info("Triggering search for series %s episodes %s", sid, episode_ids)
+    log.info("Triggering search for series %s episodes %s", series_id, episode_ids)
     await S.trigger_episode_search(episode_ids)
-
-    total = SONARR_VERIFY_GRAB_SEC
-    step = max(2, SONARR_VERIFY_POLL_SEC)
-    waited = 0
-    while waited < total:
-        if await S.has_new_grab_since(sid, episode_ids, baseline):
-            msg = (MSG_TV_REPLACED_AND_GRABBED if removed_count > 0 else MSG_TV_SEARCH_ONLY_GRABBED).format(
-                title=title, season=season, episode=episode)
-            if COMMENT_ON_ACTION:
-                await jelly_comment(issue_id, f"{PREFIX} {msg}")
-            if CLOSE_ISSUES:
-                await jelly_close(issue_id)
-            await notify(f"Remediarr - TV Fixed", f"{PREFIX} {msg}")
-            return
-        await asyncio.sleep(step)
-        waited += step
     
-    log.info("Sonarr verify window elapsed (no new grab). Not closing issue %s.", issue_id)
-    # Still comment that we tried
+    # Trust it worked - comment and close immediately
+    msg = MSG_SUCCESS
     if COMMENT_ON_ACTION:
-        await jelly_comment(issue_id, f"{PREFIX} {title} S{season:02d}E{episode:02d}: triggered search but no new download yet. Please check back later.")
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+    
+    await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: {msg}")
 
 async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Main webhook entry. We always fetch the issue to normalize fields."""
