@@ -60,21 +60,29 @@ def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-    words = set(re.split(r"[^a-z0-9]+", t))
     
     # Check for wrong movie first (movie-specific)
-    if media_type == "movie" and (words & MOV_WRONG):
-        return "wrong"
+    if media_type == "movie":
+        for keyword in MOV_WRONG:
+            if keyword in t:
+                return "wrong"
     
-    # Check other buckets
-    if words & (MOV_AUDIO | TV_AUDIO): 
-        return "audio"
-    if words & (MOV_VIDEO | TV_VIDEO): 
-        return "video"
-    if words & (MOV_SUBS | TV_SUBS):  
-        return "subtitle"
-    if words & (MOV_OTHER | TV_OTHER): 
-        return "other"
+    # Check other buckets using substring matching
+    for keyword in (MOV_AUDIO | TV_AUDIO):
+        if keyword in t:
+            return "audio"
+    
+    for keyword in (MOV_VIDEO | TV_VIDEO):
+        if keyword in t:
+            return "video"
+    
+    for keyword in (MOV_SUBS | TV_SUBS):
+        if keyword in t:
+            return "subtitle"
+    
+    for keyword in (MOV_OTHER | TV_OTHER):
+        if keyword in t:
+            return "other"
     
     return None
 
