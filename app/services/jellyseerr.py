@@ -13,10 +13,7 @@ def _base() -> str:
 
 
 def _headers() -> Dict[str, str]:
-    return {
-        "X-Api-Key": cfg.JELLYSEERR_API_KEY,
-        "Content-Type": "application/json",
-    }
+    return {"X-Api-Key": cfg.JELLYSEERR_API_KEY, "Content-Type": "application/json"}
 
 
 def _timeout() -> float:
@@ -27,9 +24,7 @@ def _timeout() -> float:
 
 
 def is_our_comment(text: str | None) -> bool:
-    if not text:
-        return False
-    return text.strip().startswith(BOT_PREFIX)
+    return bool(text and text.strip().startswith(BOT_PREFIX))
 
 
 async def jelly_fetch_issue(issue_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -47,11 +42,7 @@ async def jelly_fetch_issue(issue_id: Optional[int]) -> Optional[Dict[str, Any]]
 async def jelly_comment(issue_id: int, message: str, *, force_prefix: bool = False) -> bool:
     if not issue_id or not message:
         return False
-
-    msg = message
-    if force_prefix and not msg.strip().startswith(BOT_PREFIX):
-        msg = f"{BOT_PREFIX} {msg}"
-
+    msg = message if (not force_prefix or message.strip().startswith(BOT_PREFIX)) else f"{BOT_PREFIX} {message}"
     url = f"{_base()}/api/v1/issue/{int(issue_id)}/comment"
     payload = {"message": msg}
     log.info("Jellyseerr: posting comment to issue %s: %r", issue_id, msg)
@@ -69,15 +60,15 @@ async def jelly_close(issue_id: int, *, silent: bool = True, message: Optional[s
     if not issue_id:
         return False
 
-    # Optional close comment
     close_msg = (message or (cfg.JELLYSEERR_CLOSE_MESSAGE or "")).strip()
     if not silent and close_msg:
         await jelly_comment(issue_id, f"{BOT_PREFIX} {close_msg}", force_prefix=False)
 
-    # Mark as resolved (Jellyseerr-style)
+    # Jellyseerr uses PATCH for updates (PUT returns 405).
     url = f"{_base()}/api/v1/issue/{int(issue_id)}"
-    payload = {"status": 2}  # 2 = resolved in Overseerr/Jellyseerr
+    payload = {"status": 2}  # 2 = resolved
     async with httpx.AsyncClient(timeout=_timeout()) as c:
-        r = await c.put(url, headers=_headers(), json=payload)
+        r = await c.patch(url, headers=_headers(), json=payload)
         r.raise_for_status()
+        log.info("Jellyseerr: issue %s closed (status=%s)", issue_id, r.status_code)
         return True
