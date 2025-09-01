@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -8,119 +8,76 @@ from app.config import cfg, BOT_PREFIX
 from app.logging import log
 
 
-def _headers() -> Dict[str, str]:
-    return {
-        "X-Api-Key": cfg.JELLYSEERR_API_KEY,
-        "Authorization": f"Bearer {cfg.JELLYSEERR_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
 def _base() -> str:
     return cfg.JELLYSEERR_URL.rstrip("/")
 
 
-def _with_prefix(msg: str) -> str:
-    m = (msg or "").lstrip()
-    if not m:
-        return m
-    if not m.startswith(BOT_PREFIX):
-        return f"{BOT_PREFIX} {msg}".strip()
-    return msg
+def _headers() -> Dict[str, str]:
+    return {
+        "X-Api-Key": cfg.JELLYSEERR_API_KEY,
+        "Content-Type": "application/json",
+    }
 
 
-def is_our_comment(text: Optional[str]) -> bool:
+def _timeout() -> float:
+    try:
+        return float(getattr(cfg, "JELLYSEERR_HTTP_TIMEOUT", 30))
+    except Exception:
+        return 30.0
+
+
+def is_our_comment(text: str | None) -> bool:
     if not text:
         return False
-    return text.lstrip().startswith(BOT_PREFIX)
+    return text.strip().startswith(BOT_PREFIX)
 
 
-async def jelly_comment(issue_id: Any, message: str, *, force_prefix: bool = True) -> bool:
-    """
-    Post a comment to a Jellyseerr issue. Tries two endpoints for compatibility.
-    Also logs the outgoing comment content.
-    """
-    if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
-        return False
-
-    payload_msg = _with_prefix(message) if force_prefix else (message or "")
-    preview = payload_msg.replace("\n", " ")[:300]
-    log.info("Jellyseerr: posting comment to issue %s: %r", issue_id, preview)
-
-    paths = [
-        f"/api/v1/issue/{issue_id}/comment",
-        f"/api/v1/issues/{issue_id}/comments",
-    ]
-    async with httpx.AsyncClient(timeout=20) as c:
-        for p in paths:
-            try:
-                r = await c.post(f"{_base()}{p}", headers=_headers(), json={"message": payload_msg})
-                if r.status_code in (200, 201, 204):
-                    return True
-                log.info("jelly_comment %s -> %s %s", p, r.status_code, r.text[:180])
-            except Exception as e:
-                log.info("jelly_comment error %s: %s", p, e)
-    return False
-
-
-async def jelly_close(issue_id: Any) -> bool:
-    """
-    Resolve/close an issue. If close message is set, post it after a successful close.
-    """
-    if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
-        return False
-
-    attempts: Tuple[Tuple[str, str, Optional[Dict[str, Any]]], ...] = (
-        ("POST", f"/api/v1/issue/{issue_id}/resolved", None),
-        ("POST", f"/api/v1/issue/{issue_id}/resolve", None),
-        ("POST", f"/api/v1/issue/{issue_id}/status", {"status": "resolved"}),
-    )
-
-    async with httpx.AsyncClient(timeout=20) as c:
-        for _, path, body in attempts:
-            try:
-                r = await c.post(f"{_base()}{path}", headers=_headers(), json=body)
-                if r.status_code in (200, 204):
-                    if cfg.JELLYSEERR_CLOSE_MESSAGE:
-                        await jelly_comment(issue_id, cfg.JELLYSEERR_CLOSE_MESSAGE, force_prefix=True)
-                    return True
-                log.info("jelly_close %s -> %s %s", path, r.status_code, r.text[:180])
-            except Exception as e:
-                log.info("jelly_close error %s: %s", path, e)
-    return False
-
-
-async def jelly_fetch_issue(issue_id: Any) -> Optional[Dict[str, Any]]:
-    """
-    Fetch an issue (including recent comments) for de-dupe/guard logic.
-    Returns raw JSON dict or None.
-    """
-    if not (_base() and cfg.JELLYSEERR_API_KEY and issue_id):
+async def jelly_fetch_issue(issue_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if not issue_id:
         return None
+    url = f"{_base()}/api/v1/issue/{int(issue_id)}"
+    async with httpx.AsyncClient(timeout=_timeout()) as c:
+        r = await c.get(url, headers=_headers())
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
 
-    paths = [
-        f"/api/v1/issue/{issue_id}",
-        f"/api/v1/issues/{issue_id}",
-    ]
-    async with httpx.AsyncClient(timeout=20) as c:
-        for p in paths:
-            try:
-                r = await c.get(f"{_base()}{p}", headers=_headers())
-                if r.status_code == 404:
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                # Best-effort debug preview of the last comment
-                comments = data.get("comments") or data.get("activity") or []
-                if isinstance(comments, list) and comments:
-                    last = comments[-1]
-                    txt = (last.get("message") or last.get("text") or "").replace("\n", " ")[:300]
-                    log.info("Jellyseerr: last comment on issue %s: %r", issue_id, txt)
-                return data
-            except httpx.HTTPStatusError as e:
-                if e.response is not None and e.response.status_code == 404:
-                    continue
-                log.info("jelly_fetch_issue HTTP error %s: %s", p, e)
-            except Exception as e:
-                log.info("jelly_fetch_issue error %s: %s", p, e)
-    return None
+
+async def jelly_comment(issue_id: int, message: str, *, force_prefix: bool = False) -> bool:
+    if not issue_id or not message:
+        return False
+
+    msg = message
+    if force_prefix and not msg.strip().startswith(BOT_PREFIX):
+        msg = f"{BOT_PREFIX} {msg}"
+
+    url = f"{_base()}/api/v1/issue/{int(issue_id)}/comment"
+    payload = {"message": msg}
+    log.info("Jellyseerr: posting comment to issue %s: %r", issue_id, msg)
+    async with httpx.AsyncClient(timeout=_timeout()) as c:
+        r = await c.post(url, headers=_headers(), json=payload)
+        r.raise_for_status()
+        return True
+
+
+async def jelly_close(issue_id: int, *, silent: bool = True, message: Optional[str] = None) -> bool:
+    """
+    Close the issue. If silent=True, do not post a separate close comment.
+    If silent=False and a message is provided (or configured), post it first, then close.
+    """
+    if not issue_id:
+        return False
+
+    # Optional close comment
+    close_msg = (message or (cfg.JELLYSEERR_CLOSE_MESSAGE or "")).strip()
+    if not silent and close_msg:
+        await jelly_comment(issue_id, f"{BOT_PREFIX} {close_msg}", force_prefix=False)
+
+    # Mark as resolved (Jellyseerr-style)
+    url = f"{_base()}/api/v1/issue/{int(issue_id)}"
+    payload = {"status": 2}  # 2 = resolved in Overseerr/Jellyseerr
+    async with httpx.AsyncClient(timeout=_timeout()) as c:
+        r = await c.put(url, headers=_headers(), json=payload)
+        r.raise_for_status()
+        return True

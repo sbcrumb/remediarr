@@ -13,7 +13,7 @@ from app.services import sonarr as S
 from app.services import radarr as R
 
 
-# ---------- simple per-issue cooldown to stop loops ----------
+# ---------- per-issue cooldown to stop loops ----------
 _RECENT_ACTIONS: dict[int, float] = {}
 _COOLDOWN_SEC: int = getattr(cfg, "ACTION_COOLDOWN_SEC", 120)
 
@@ -238,21 +238,21 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
                 await jelly_comment(issue_id, coach, force_prefix=False)
         return {"found": True, "acted": False, "seriesId": series_id}
 
+    # Delete files quietly (log-only, no user-facing progress comment)
     deleted = await S.delete_episodefiles_by_episode_ids(await S.find_episode_ids(series_id, season, episode))
-    if issue_id:
-        msg = _ensure_prefixed(f"Queued replacement: removed {deleted} episode file(s). Triggering search…")
-        if not await _already_posted_same(issue_id, msg):
-            await jelly_comment(issue_id, msg, force_prefix=False)
+    log.info("Series %s delete_episodefiles: removed=%s", series_id, deleted)
 
+    # Trigger search
     await S.search_series(series_id)
 
+    # Verify via queue/grab
     ok = await _poll_until(lambda: S.history_has_recent_grab(series_id, cfg.SONARR_VERIFY_GRAB_SEC), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) \
          or await _poll_until(lambda: S.queue_has_series(series_id), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
         if season is not None and episode is not None:
             msg = (cfg.MSG_TV_REPLACED_AND_GRABBED or
-                   "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue.")
+                   "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue. If anything’s still off, comment and I’ll take another pass.")
             msg = msg.format(
                 title=title or series.get("title") or "Unknown",
                 season=season or 0,
@@ -261,7 +261,7 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
             )
         else:
             msg = (cfg.MSG_TV_SEARCH_ONLY_GRABBED or
-                   "{title}: new downloads are being grabbed. Closing this issue.")
+                   "{title}: new downloads are being grabbed. Closing this issue. If anything’s still off, comment and I’ll take another pass.")
             msg = msg.format(
                 title=title or series.get("title") or "Unknown",
                 season=0, episode=0, keywords=kws_text,
@@ -270,7 +270,7 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], imdb: Opt
         if not await _already_posted_same(issue_id, msg):
             await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
-            await jelly_close(issue_id)
+            await jelly_close(issue_id, silent=True)  # close without extra comment
         return {"found": True, "acted": True, "seriesId": series_id, "queued": True}
 
     if issue_id:
@@ -317,23 +317,20 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
                 await jelly_comment(issue_id, coach, force_prefix=False)
         return {"found": True, "acted": False, "movieId": movie_id}
 
-    # Delete files (if any)
+    # Delete files quietly (log-only, no user-facing progress comment)
     deleted = await R.delete_moviefiles(movie_id)
-    if issue_id:
-        msg = _ensure_prefixed(f"Queued replacement: removed {deleted} movie file(s). Triggering search…")
-        if not await _already_posted_same(issue_id, msg):
-            await jelly_comment(issue_id, msg, force_prefix=False)
+    log.info("Movie %s delete_moviefiles: removed=%s", movie_id, deleted)
 
     # Trigger search (fixed payload)
     await R.search_movie(movie_id)
 
-    # Verify using queue primarily; history is best-effort
+    # Verify: queue first; history best-effort
     ok = await _poll_until(lambda: R.queue_has_movie(movie_id), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC) \
          or await _poll_until(lambda: R.history_has_recent_grab(movie_id, cfg.RADARR_VERIFY_GRAB_SEC), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
         msg = (cfg.MSG_MOVIE_REPLACED_AND_GRABBED or
-               "{title}: replaced file; new download grabbed. Closing this issue.")
+               "{title}: replaced file; new download grabbed. Closing this issue. If anything’s still off, comment and I’ll take another pass.")
         msg = _ensure_prefixed(msg.format(
             title=title or movie.get("title") or "Unknown",
             season=0, episode=0, keywords=kws_text,
@@ -341,7 +338,7 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
         if not await _already_posted_same(issue_id, msg):
             await jelly_comment(issue_id, msg, force_prefix=False)
         if cfg.CLOSE_JELLYSEERR_ISSUES:
-            await jelly_close(issue_id)
+            await jelly_close(issue_id, silent=True)  # close without extra comment
         return {"found": True, "acted": True, "movieId": movie_id, "queued": True}
 
     if issue_id:
@@ -379,7 +376,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = _gather_text_for_keywords(payload)
     bucket = _match_bucket(media_type, text)
 
-    # Fallback scan from latest human comment
+    # Fallback: fetch issue and scan the latest non-bot comment
     if (not comment_text or not text) or bucket is None:
         issue_json = await jelly_fetch_issue(issue_id) if issue_id else None
         last_human = _latest_human_comment_text(issue_json)
@@ -396,17 +393,16 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         event or "unknown", issue_id, media_type, tmdb, tvdb, imdb, title, year, season, episode, bucket
     )
 
-    # Prevent repeated actions on the same issue for a short period
+    # Prevent repeated actions within a short period
     if bucket and _under_cooldown(issue_id):
         return {"ok": True, "ignored": "cooldown"}
 
-    # Optional ack on user comments (not ours)
+    # (Optional) ack is still supported via env; set ACK_ON_COMMENT_CREATED=false to disable
     if event.find("comment") != -1 and comment_text and not is_our_comment(comment_text) and cfg.ACK_ON_COMMENT_CREATED and issue_id:
         ack = _ensure_prefixed("Thanks! Running automated remediation…")
         if not await _already_posted_same(issue_id, ack):
             await jelly_comment(issue_id, ack, force_prefix=False)
 
-    # Mark action moment (so subsequent webhooks within N sec are skipped)
     if bucket:
         _mark_action(issue_id)
 
