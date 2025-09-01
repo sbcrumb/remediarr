@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 import httpx
@@ -24,20 +25,33 @@ async def send_gotify(title: str, message: str, priority: Optional[int] = None) 
                 json=data,
             )
             r.raise_for_status()
+            log.info("Gotify notification sent successfully")
     except Exception as e:
-        log.info("Gotify send failed: %s", e)
+        log.warning("Gotify send failed: %s", e)
 
 
 async def send_apprise(title: str, message: str) -> None:
     if not cfg.APPRISE_URLS:
         return
     try:
-        a = apprise.Apprise()
-        for url in [u.strip() for u in cfg.APPRISE_URLS.split(";") if u.strip()]:
-            a.add(url)
-        a.notify(title=title, body=message)
+        # Run the blocking apprise calls in a thread pool to avoid blocking the event loop
+        def _send_apprise_sync():
+            a = apprise.Apprise()
+            for url in [u.strip() for u in cfg.APPRISE_URLS.split(";") if u.strip()]:
+                a.add(url)
+            return a.notify(title=title, body=message)
+        
+        # Execute in thread pool to prevent blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _send_apprise_sync)
+        
+        if result:
+            log.info("Apprise notification sent successfully")
+        else:
+            log.warning("Apprise notification failed to send")
+            
     except Exception as e:
-        log.info("Apprise send failed: %s", e)
+        log.warning("Apprise send failed: %s", e)
 
 
 async def notify(title: str, message: str) -> None:
