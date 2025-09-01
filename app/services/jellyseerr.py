@@ -26,7 +26,13 @@ async def jelly_fetch_issue(issue_id: int) -> Dict[str, Any]:
     url = f"{BASE}/api/v1/issue/{issue_id}"
     r = await _client_lazy().get(url, headers=_headers)
     r.raise_for_status()
-    return r.json()
+    issue_data = r.json()
+    
+    # Log the raw issue data to debug season/episode extraction
+    log.info("Raw Jellyseerr issue data for %s: affectedSeason=%s, affectedEpisode=%s", 
+             issue_id, issue_data.get("affectedSeason"), issue_data.get("affectedEpisode"))
+    
+    return issue_data
 
 def _extract_issue_context(issue_json: Dict[str, Any]) -> Dict[str, Any]:
     # Media

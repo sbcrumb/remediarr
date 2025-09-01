@@ -96,10 +96,21 @@ def _to_int_or_none(val) -> Optional[int]:
             return int(val)
         if isinstance(val, str):
             s = val.strip()
+            # Skip template placeholders
             if s.startswith("{{") and s.endswith("}}"):
                 return None
+            # Skip empty or placeholder values
+            if s in ("", "null", "undefined", "None"):
+                return None
+            # Extract first number found
             m = re.search(r"\d+", s)
-            return int(m.group()) if m else None
+            if m:
+                num = int(m.group())
+                # Sanity check - seasons shouldn't be > 100, episodes shouldn't be > 1000
+                if num > 1000:
+                    return None
+                return num
+            return None
     except Exception:
         return None
     return None
@@ -159,13 +170,56 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     if not tvdb_id:
         raise ValueError("Missing tvdbId")
 
-    # Try explicit keys first
-    c_s = [media.get("seasonNumber"), media.get("season"),
-           issue.get("affected_season"), issue.get("affectedSeason"), issue.get("season")]
-    c_e = [media.get("episodeNumber"), media.get("episode"),
-           issue.get("affected_episode"), issue.get("affectedEpisode"), issue.get("episode")]
-    season = next((v for v in (_to_int_or_none(x) for x in c_s) if v is not None), None)
-    episode = next((v for v in (_to_int_or_none(x) for x in c_e) if v is not None), None)
+    # Try explicit keys first - handle both string and int values
+    season_candidates = [
+        issue.get("affected_season"), 
+        issue.get("affectedSeason"),
+        media.get("seasonNumber"), 
+        media.get("season")
+    ]
+    episode_candidates = [
+        issue.get("affected_episode"), 
+        issue.get("affectedEpisode"),
+        media.get("episodeNumber"), 
+        media.get("episode")
+    ]
+    
+    season = None
+    episode = None
+    
+    # Extract season
+    for candidate in season_candidates:
+        if candidate is not None:
+            # Handle string values that might be numbers
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+                if candidate and not candidate.startswith("{{"):
+                    try:
+                        season = int(candidate)
+                        break
+                    except ValueError:
+                        continue
+            elif isinstance(candidate, (int, float)):
+                season = int(candidate)
+                break
+    
+    # Extract episode  
+    for candidate in episode_candidates:
+        if candidate is not None:
+            # Handle string values that might be numbers
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+                if candidate and not candidate.startswith("{{"):
+                    try:
+                        episode = int(candidate)
+                        break
+                    except ValueError:
+                        continue
+            elif isinstance(candidate, (int, float)):
+                episode = int(candidate)
+                break
+
+    log.info("After explicit extraction: season=%s, episode=%s", season, episode)
 
     # Fallback: parse from text
     if season is None or episode is None:
@@ -180,22 +234,39 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
         s2, e2 = _extract_season_episode_from_text(text)
         season = season if season is not None else s2
         episode = episode if episode is not None else e2
+        if s2 or e2:
+            log.info("After text parsing: season=%s, episode=%s", season, episode)
 
     # Fallback: walk the entire payload for season/episode
     if season is None or episode is None:
         s3, e3 = _walk_for_season_episode(payload)
         season = season if season is not None else s3
         episode = episode if episode is not None else e3
+        if s3 or e3:
+            log.info("After payload walk: season=%s, episode=%s", season, episode)
 
     # Final fallback: fetch issue from Jellyseerr API
     if (season is None or episode is None) and issue.get("issue_id"):
         try:
             full_issue = await jelly_fetch_issue(int(issue.get("issue_id")))
-            s4, e4 = _walk_for_season_episode(full_issue)
-            season = season if season is not None else s4
-            episode = episode if episode is not None else e4
-            if season and episode:
-                log.info("Found S/E from Jellyseerr API: S%02dE%02d", season, episode)
+            # Look for affectedSeason/affectedEpisode in the API response
+            api_season = full_issue.get("affectedSeason")
+            api_episode = full_issue.get("affectedEpisode")
+            
+            if api_season is not None and season is None:
+                try:
+                    season = int(api_season)
+                    log.info("Found season from API: %s", season)
+                except (ValueError, TypeError):
+                    pass
+                    
+            if api_episode is not None and episode is None:
+                try:
+                    episode = int(api_episode)
+                    log.info("Found episode from API: %s", episode)
+                except (ValueError, TypeError):
+                    pass
+                    
         except Exception as e:
             log.warning("Failed to fetch issue details: %s", e)
 
@@ -206,6 +277,12 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     
     if season is None or episode is None:
         raise ValueError(f"Missing season/episode after all extraction attempts: S{season}E{episode}")
+    
+    # Sanity check the values
+    if season < 1 or season > 50:
+        raise ValueError(f"Invalid season number: {season}")
+    if episode < 1 or episode > 1000:
+        raise ValueError(f"Invalid episode number: {episode}")
     
     return series["id"], series, int(season), int(episode)
 
