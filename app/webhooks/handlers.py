@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -62,7 +63,107 @@ async def _poll_until(pred_coro_factory, total_sec: int, poll_sec: int) -> bool:
 
 
 # -------------------------------------------------------------------
-# Keyword + payload parsing
+# Deep extraction utilities (payloads vary by event type)
+# -------------------------------------------------------------------
+
+_SXE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
+
+def _deep_iter(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            for x in _deep_iter(v):
+                yield x
+    elif isinstance(obj, list):
+        for v in obj:
+            for x in _deep_iter(v):
+                yield x
+
+
+def _deep_find_first_int(payload: Dict[str, Any], *names: str) -> Optional[int]:
+    for node in _deep_iter(payload):
+        if isinstance(node, dict):
+            for n in names:
+                if n in node:
+                    try:
+                        return int(node[n])
+                    except Exception:
+                        continue
+    return None
+
+
+def _deep_find_first_str(payload: Dict[str, Any], *names: str) -> Optional[str]:
+    for node in _deep_iter(payload):
+        if isinstance(node, dict):
+            for n in names:
+                v = node.get(n)
+                if isinstance(v, str) and v.strip():
+                    return v
+    return None
+
+
+def _extract_media_type(payload: Dict[str, Any]) -> Optional[str]:
+    mt = _deep_find_first_str(payload, "mediaType")
+    if mt:
+        return mt.lower()
+    # some events put it under media.mediaType
+    media = None
+    for node in _deep_iter(payload):
+        if isinstance(node, dict) and "media" in node and isinstance(node["media"], dict):
+            media = node["media"]
+            break
+    if media:
+        mt = (media.get("mediaType") or "").lower()
+        if mt:
+            return mt
+    return None
+
+
+def _extract_issue_id(payload: Dict[str, Any]) -> Optional[int]:
+    # common locations + fallbacks
+    iid = _deep_find_first_int(payload, "issueId", "id")
+    return iid
+
+
+def _parse_sxe_from_string(s: str) -> Tuple[Optional[int], Optional[int]]:
+    m = _SXE_RE.search(s or "")
+    if not m:
+        return None, None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except Exception:
+        return None, None
+
+
+def _extract_season_episode(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    # direct ints in many Jellyseerr variants
+    for node in _deep_iter(payload):
+        if not isinstance(node, dict):
+            continue
+        s = node.get("affectedSeason") or node.get("season") or node.get("seasonNumber")
+        e = node.get("affectedEpisode") or node.get("episode") or node.get("episodeNumber")
+        try:
+            if s is not None and e is not None:
+                return int(s), int(e)
+        except Exception:
+            # sometimes they arrive as SxxEyy string
+            if isinstance(s, str) and isinstance(e, str):
+                ss, ee = _parse_sxe_from_string(f"S{s}E{e}")
+                if ss is not None and ee is not None:
+                    return ss, ee
+
+    # single string "S07E13" somewhere?
+    sxe = _deep_find_first_str(payload, "sxe", "episodeCode", "code")
+    if sxe:
+        ss, ee = _parse_sxe_from_string(sxe)
+        if ss is not None and ee is not None:
+            return ss, ee
+
+    return None, None
+
+
+# -------------------------------------------------------------------
+# Keyword parsing
 # -------------------------------------------------------------------
 
 def _classify_bucket(text: Optional[str]) -> Optional[str]:
@@ -72,7 +173,6 @@ def _classify_bucket(text: Optional[str]) -> Optional[str]:
     def any_in(needles: Sequence[str]) -> bool:
         return any(n for n in needles if n and n.strip().lower() in t)
 
-    # video first to catch "no video"/"black screen"
     if any_in((cfg.TV_VIDEO_KEYWORDS or "").split(",")) or any_in((cfg.MOVIE_VIDEO_KEYWORDS or "").split(",")):
         return "video"
     if any_in((cfg.TV_AUDIO_KEYWORDS or "").split(",")) or any_in((cfg.MOVIE_AUDIO_KEYWORDS or "").split(",")):
@@ -86,37 +186,13 @@ def _classify_bucket(text: Optional[str]) -> Optional[str]:
     return None
 
 
-def _extract_season_episode(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Jellyseerr puts these in different places depending on event.
-    Try a few common paths safely.
-    """
-    for obj in (payload.get("issue") or {}, payload.get("data") or {}, payload):
-        for skey in ("affectedSeason", "season", "seasonNumber"):
-            for ekey in ("affectedEpisode", "episode", "episodeNumber"):
-                s = obj.get(skey)
-                e = obj.get(ekey)
-                if isinstance(s, int) and isinstance(e, int):
-                    return s, e
-                # strings -> ints
-                try:
-                    ss = int(s) if s is not None else None
-                    ee = int(e) if e is not None else None
-                    if ss is not None and ee is not None:
-                        return ss, ee
-                except Exception:
-                    pass
-    return None, None
-
-
 def _last_human_comment_text(issue_json: Optional[Dict[str, Any]]) -> Optional[str]:
     if not issue_json:
         return None
     comments = issue_json.get("comments") or []
     if not isinstance(comments, list) or not comments:
         return None
-    # newest last
-    for c in reversed(comments):
+    for c in reversed(comments):  # newest last
         msg = c.get("message") or ""
         if not is_our_comment(msg):
             return msg
@@ -129,54 +205,74 @@ def _last_human_comment_text(issue_json: Optional[Dict[str, Any]]) -> Optional[s
 
 async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Single public entrypoint used by router.
-    We post only ONE final success comment if verification passes.
-    Otherwise we stay quiet (issue remains open) except for missing-keyword coaching.
+    Robust webhook handler:
+      - digs for issueId/season/episode/mediaType in any nesting
+      - if issueId found but no S/E, fetch issue to enrich
+      - for TV: ONLY act when exact episode is known
+      - post ONE success comment after verification; otherwise stay quiet (except for coaching)
     """
-    # Common fields
-    event = (payload.get("event") or payload.get("type") or "").lower()
-    issue = payload.get("issue") or {}
-    media = payload.get("media") or {}
-    media_type = (media.get("mediaType") or payload.get("mediaType") or issue.get("mediaType") or "").lower()
-    issue_id = issue.get("id") or payload.get("issueId") or payload.get("id")
-    tmdb = media.get("tmdbId") or payload.get("tmdbId") or issue.get("tmdbId")
-    tvdb = media.get("tvdbId") or payload.get("tvdbId") or issue.get("tvdbId")
-    imdb = media.get("imdbId") or payload.get("imdbId") or issue.get("imdbId")
+    # event label (best-effort)
+    event = (payload.get("event") or payload.get("type") or _deep_find_first_str(payload, "eventType") or "").lower()
 
-    # Fetch issue for: comments (loop guard + classification) + season/episode fallback
-    issue_json = await jelly_fetch_issue(issue_id)
-    last_comment = _last_human_comment_text(issue_json)
-    if last_comment:
-        log.info("Jellyseerr: last comment on issue %s: %r", issue_id, last_comment)
+    # extract ids/type from anywhere
+    issue_id = _extract_issue_id(payload)
+    media_type = _extract_media_type(payload) or ""
 
-    # Season/Episode
+    # media IDs (usually present)
+    media = None
+    for node in _deep_iter(payload):
+        if isinstance(node, dict) and "media" in node and isinstance(node["media"], dict):
+            media = node["media"]
+            break
+    tmdb = (media or {}).get("tmdbId") or _deep_find_first_int(payload, "tmdbId")
+    tvdb = (media or {}).get("tvdbId") or _deep_find_first_int(payload, "tvdbId")
+    imdb = (media or {}).get("imdbId") or _deep_find_first_str(payload, "imdbId")
+
+    # try S/E from payload (various shapes)
     season, episode = _extract_season_episode(payload)
-    if season is None or episode is None:
-        # try to read from issue object if API returned them
-        s = (issue_json or {}).get("season")
-        e = (issue_json or {}).get("episode")
-        try:
-            season = int(s) if season is None and s is not None else season
-            episode = int(e) if episode is None and e is not None else episode
-        except Exception:
-            pass
 
-    # Bucket by current comment (if present), else last human comment
-    comment_text = (payload.get("comment") or {}).get("message") or (payload.get("comment") or {}).get("text")
-    bucket = _classify_bucket(comment_text) or _classify_bucket(last_comment)
+    # If we have an issue id, pull the authoritative record to enrich missing pieces.
+    issue_json = None
+    if issue_id:
+        try:
+            issue_json = await jelly_fetch_issue(issue_id)
+        except Exception as e:
+            log.info("Jellyseerr: fetch issue %s failed: %s", issue_id, e)
+
+    if issue_json:
+        # mediaType may be missing/ambiguous in some events
+        if not media_type:
+            media_type = (issue_json.get("mediaType") or "").lower()
+        # season/episode often present on the stored issue even if webhook omitted them
+        if season is None or episode is None:
+            try:
+                s = issue_json.get("affectedSeason") or issue_json.get("season")
+                e = issue_json.get("affectedEpisode") or issue_json.get("episode")
+                if s is not None and e is not None:
+                    season, episode = int(s), int(e)
+            except Exception:
+                pass
+
+    # Classify bucket from immediate comment or last human comment on the issue
+    comment_text = (payload.get("comment") or {}).get("message") \
+                   or (payload.get("comment") or {}).get("text") \
+                   or _deep_find_first_str(payload, "message", "text")
+    if issue_json and not comment_text:
+        comment_text = _last_human_comment_text(issue_json)
+    bucket = _classify_bucket(comment_text)
 
     log.info(
         "Webhook event=%s issue_id=%s media_type=%s tmdb=%s tvdb=%s imdb=%s season=%s episode=%s bucket=%s",
         event or "?", issue_id, media_type or "?", tmdb, tvdb, imdb, season, episode, bucket
     )
 
-    # Loop prevention: ignore if our own last comment just fired the webhook
+    # loop prevention
     cd, remain = _under_cooldown(issue_id)
     if cd:
         log.info("Issue %s under cooldown (%ss remaining) — skipping.", issue_id, remain)
         return {"cooldown": True}
 
-    # Missing keyword coaching (only if no bucket)
+    # Missing keyword coaching
     if not bucket:
         msg = _ensure_prefixed(
             "Tip: include one of these keywords next time so I can repair this automatically: "
@@ -189,20 +285,20 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             _arm_cooldown(issue_id)
         return {"coached": True}
 
-    # Route by media type
-    if media_type == "movie":
+    # Movies
+    if (media_type or "").lower() == "movie":
         detail = await _handle_movie(issue_id, tmdb, imdb, bucket)
         _arm_cooldown(issue_id)
         return detail
 
-    # For TV, we only act if we have an exact episode to target.
-    if media_type in ("tv", "show", "series"):
+    # Series — ONLY if we know the exact episode
+    if (media_type or "").lower() in ("tv", "show", "series"):
         if season is None or episode is None:
             log.info("Series missing season/episode. Not acting to avoid season-wide search.")
             return {"series": True, "skipped": "no-season-episode"}
         detail = await _handle_series(issue_id, tvdb, season, episode, bucket)
         _arm_cooldown(issue_id)
-        return detail
+        return detail)
 
     log.info("Unknown media_type=%r; ignoring.", media_type)
     return {"ignored": True}
@@ -222,18 +318,13 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
     movie_id = int(movie["id"])
     title = movie.get("title") or "This title"
 
-    # Always delete immediately (best effort)
     deleted = await R.delete_moviefiles(movie_id)
-
-    # Trigger search
     await R.search_movie(movie_id)
 
-    # Verify via queue or recent 'grabbed'
     ok = await _poll_until(lambda: R.queue_has_movie(movie_id), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC) \
          or await _poll_until(lambda: R.history_has_recent_grab(movie_id, cfg.RADARR_VERIFY_GRAB_SEC), cfg.RADARR_VERIFY_GRAB_SEC, cfg.RADARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
-        # Post single final message and close
         tmpl = (cfg.MSG_MOVIE_REPLACED_AND_GRABBED if deleted else cfg.MSG_MOVIE_SEARCH_ONLY_GRABBED) or "{title}: new download grabbed. Closing this issue."
         msg = _ensure_prefixed(tmpl.format(title=title, deleted=deleted))
         await jelly_comment(issue_id, msg, force_prefix=False)
@@ -261,24 +352,18 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], season: i
     series_id = int(series["id"])
     title = series.get("title") or "This show"
 
-    # Identify the exact episode ids
     ep_ids = await S.find_episode_ids(series_id, season, episode)
     if not ep_ids:
         log.info("Sonarr: could not map S%02dE%02d to episode ids; not acting.", season, episode)
         return {"series": True, "skipped": "no-episode-ids"}
 
-    # Delete only those episode files
     deleted = await S.delete_episodefiles_by_episode_ids(series_id, ep_ids)
-
-    # Search only those episode ids
     await S.search_episode_ids(ep_ids)
 
-    # Verify (queue or recent grabbed) for those episode ids
     ok = await _poll_until(lambda: S.queue_has_any_of_episode_ids(ep_ids), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC) \
          or await _poll_until(lambda: S.history_has_recent_grab_for_episode_ids(series_id, ep_ids, cfg.SONARR_VERIFY_GRAB_SEC), cfg.SONARR_VERIFY_GRAB_SEC, cfg.SONARR_VERIFY_POLL_SEC)
 
     if ok and issue_id:
-        # One final message + close
         base_tmpl = (cfg.MSG_TV_REPLACED_AND_GRABBED if deleted else cfg.MSG_TV_SEARCH_ONLY_GRABBED) or "{title} S{season:02d}E{episode:02d}: new download grabbed. Closing this issue."
         msg = _ensure_prefixed(base_tmpl.format(title=title, season=season, episode=episode, deleted=deleted))
         await jelly_comment(issue_id, msg, force_prefix=False)
