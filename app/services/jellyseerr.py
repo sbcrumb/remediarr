@@ -1,129 +1,113 @@
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
+import logging
+from typing import Optional, Tuple, Dict, Any
 
 import httpx
 
-from app.config import cfg, BOT_PREFIX
-from app.logging import log
+log = logging.getLogger("remediarr")
 
+JELLYSEERR_URL = os.getenv("JELLYSEERR_URL", "").rstrip("/")
+JELLYSEERR_API_KEY = os.getenv("JELLYSEERR_API_KEY", "")
+COMMENT_PREFIX = "[Remediarr]"  # hardcoded to prevent loops
 
-def _base() -> str:
-    return (cfg.JELLYSEERR_URL or "").rstrip("/")
-
-
-def _headers() -> Dict[str, str]:
-    return {"X-Api-Key": cfg.JELLYSEERR_API_KEY or ""}
-
-
-def _timeout() -> float:
-    try:
-        return float(getattr(cfg, "JELLYSEERR_HTTP_TIMEOUT", 30))
-    except Exception:
-        return 30.0
+HEADERS = {"X-Api-Key": JELLYSEERR_API_KEY}
 
 
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=_base(), headers=_headers(), timeout=_timeout())
+    return httpx.AsyncClient(base_url=JELLYSEERR_URL, headers=HEADERS, timeout=30.0)
 
 
-def is_our_comment(msg: Optional[str]) -> bool:
-    if not msg:
-        return False
-    return msg.strip().startswith(BOT_PREFIX)
+def _prefixed(msg: str) -> str:
+    m = (msg or "").strip()
+    if not m.startswith(COMMENT_PREFIX):
+        return f"{COMMENT_PREFIX} {m}"
+    return m
 
 
-async def jelly_comment(issue_id: int, message: str, *, force_prefix: bool = False) -> None:
-    """Post a comment. If force_prefix is False, assume the caller already prefixed."""
-    msg = message
-    if force_prefix and not is_our_comment(message):
-        msg = f"{BOT_PREFIX} {message}"
+async def jelly_comment(issue_id: int, message: str) -> None:
+    msg = _prefixed(message)
     log.info("Jellyseerr: posting comment to issue %s: %r", issue_id, msg)
     async with _client() as c:
         r = await c.post(f"/api/v1/issue/{issue_id}/comment", json={"message": msg})
         r.raise_for_status()
 
 
-async def jelly_fetch_issue(issue_id: int) -> Optional[Dict[str, Any]]:
+async def jelly_close(issue_id: int) -> bool:
+    """
+    Close an issue using the most compatible endpoint:
+    1) POST /api/v1/issue/{id}/resolve
+    2) PATCH /api/v1/issue/{id}  body: {"status": 2}
+    Returns True on success, False on failure.
+    """
+    async with _client() as c:
+        # 1) resolve endpoint (preferred)
+        try:
+            r = await c.post(f"/api/v1/issue/{issue_id}/resolve")
+            if r.status_code < 400:
+                return True
+        except httpx.HTTPError:
+            pass
+
+        # 2) PATCH fallback
+        try:
+            r = await c.patch(f"/api/v1/issue/{issue_id}", json={"status": 2})
+            if r.status_code < 400:
+                return True
+        except httpx.HTTPError:
+            pass
+
+    return False
+
+
+async def is_our_comment(text: str) -> bool:
+    return (text or "").strip().startswith(COMMENT_PREFIX)
+
+
+async def jelly_fetch_issue(issue_id: int) -> Dict[str, Any]:
+    """
+    Fetch issue details and return a compact dict:
+      {
+        "last_comment": "text or ''",
+        "last_comment_is_ours": bool,
+        "affected_season": int|None,
+        "affected_episode": int|None,
+        "media_type": "movie"|"tv"|None,
+        "tmdbId": int|None,
+        "tvdbId": int|None,
+        "title": str|None
+      }
+    """
     async with _client() as c:
         r = await c.get(f"/api/v1/issue/{issue_id}")
         r.raise_for_status()
-        data = r.json()
-        # Light log of last human comment
-        comments = data.get("comments") or []
-        last = None
-        for cmt in reversed(comments):
-            text = cmt.get("message")
-            if not is_our_comment(text):
-                last = text
-                break
-        if last is not None:
-            log.info("Jellyseerr: last comment on issue %s: %r", issue_id, last)
-        return data
+        data = r.json() or {}
 
+    comments = data.get("comments") or []
+    last_comment = comments[-1].get("message") if comments else ""
+    last_comment_is_ours = await is_our_comment(last_comment or "")
 
-async def jelly_list_issues(*, take: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
-    """List latest issues. We filter client-side for robustness."""
-    async with _client() as c:
-        r = await c.get("/api/v1/issue", params={"take": take, "skip": skip, "sort": "createdAt"})
-        r.raise_for_status()
-        data = r.json() or []
-    return data if isinstance(data, list) else []
+    issue = data.get("issue") or {}
+    media = data.get("media") or data.get("mediaInfo") or {}
 
+    # try common fields
+    affected_season = issue.get("affectedSeason") if isinstance(issue.get("affectedSeason"), int) else None
+    affected_episode = issue.get("affectedEpisode") if isinstance(issue.get("affectedEpisode"), int) else None
 
-async def jelly_find_issue_by_media(
-    *, tmdb: Optional[int] = None, tvdb: Optional[int] = None, imdb: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
-    """
-    Some webhooks do not include issueId. In that case we grab recent issues and
-    choose the newest matching media entry that is still open.
-    """
-    # Try a couple of pages just in case
-    pages = [0, 50]
-    for off in pages:
-        items = await jelly_list_issues(take=50, skip=off)
-        for it in items:
-            media = it.get("media") or {}
-            if (
-                (tmdb and media.get("tmdbId") == tmdb)
-                or (tvdb and media.get("tvdbId") == tvdb)
-                or (imdb and media.get("imdbId") == imdb)
-            ):
-                # Prefer open issues
-                status = (it.get("status") or "").lower()
-                if status in ("open", 0, "0") or status == "" or status is None:
-                    return it
-                # If nothing open is found, still return the newest match
-                return it
-    return None
+    media_type = (media.get("mediaType") or issue.get("mediaType") or "").lower() or None
+    tmdb_id = media.get("tmdbId") or issue.get("tmdbId")
+    tvdb_id = media.get("tvdbId") or issue.get("tvdbId")
+    title = media.get("title") or data.get("title")
 
-
-async def jelly_close(issue_id: int, *, silent: bool = True, close_message: Optional[str] = None) -> bool:
-    """
-    Close an issue. Jellyseerr variants differ; try the known patterns:
-      1) POST /issue/{id}/resolve
-      2) PATCH /issue/{id} {"status":2}
-    """
-    async with _client() as c:
-        # Attempt #1: explicit resolve endpoint
-        try:
-            r = await c.post(f"/api/v1/issue/{issue_id}/resolve")
-            if r.status_code // 100 == 2:
-                if not silent and close_message:
-                    await jelly_comment(issue_id, f"{BOT_PREFIX} {close_message}", force_prefix=False)
-                return True
-        except httpx.HTTPError as e:
-            log.info("Jellyseerr resolve endpoint failed (will retry with PATCH): %s", e)
-
-        # Attempt #2: PATCH set status=2 (resolved)
-        try:
-            r2 = await c.patch(f"/api/v1/issue/{issue_id}", json={"status": 2})
-            if r2.status_code // 100 == 2:
-                if not silent and close_message:
-                    await jelly_comment(issue_id, f"{BOT_PREFIX} {close_message}", force_prefix=False)
-                return True
-            log.info("Jellyseerr PATCH close returned %s", r2.status_code)
-        except httpx.HTTPError as e:
-            log.info("Jellyseerr PATCH /issue/%s failed: %s", issue_id, e)
-
-    return False
+    info = {
+        "last_comment": last_comment or "",
+        "last_comment_is_ours": bool(last_comment_is_ours),
+        "affected_season": affected_season,
+        "affected_episode": affected_episode,
+        "media_type": media_type,
+        "tmdbId": tmdb_id,
+        "tvdbId": tvdb_id,
+        "title": title,
+    }
+    if last_comment:
+        log.info("Jellyseerr: last comment on issue %s: %r", issue_id, last_comment)
+    return info
