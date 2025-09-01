@@ -1,8 +1,7 @@
 import os
 import logging
-import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -10,130 +9,114 @@ log = logging.getLogger("remediarr")
 
 SONARR_URL = os.getenv("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
-SONARR_HTTP_TIMEOUT = float(os.getenv("SONARR_HTTP_TIMEOUT", "60"))
+SONARR_HTTP_TIMEOUT = int(os.getenv("SONARR_HTTP_TIMEOUT", "60"))
 
-HEADERS = {"X-Api-Key": SONARR_API_KEY}
+def _headers() -> Dict[str, str]:
+    return {"X-Api-Key": SONARR_API_KEY} if SONARR_API_KEY else {}
 
+def _ts_from_iso(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
 
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=SONARR_URL, headers=HEADERS, timeout=SONARR_HTTP_TIMEOUT)
-
-
-async def get_series_by_tvdb(tvdb_id: int) -> Optional[dict]:
-    async with _client() as c:
-        r = await c.get("/api/v3/series", params={"tvdbId": tvdb_id})
+async def get_series_by_tvdb(tvdb_id: int) -> Optional[Dict[str, Any]]:
+    if not tvdb_id:
+        return None
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        r = await c.get(f"{SONARR_URL}/api/v3/series",
+                        params={"tvdbId": tvdb_id},
+                        headers=_headers())
         r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
-            return data[0] if data else None
-        return data or None
+        items = r.json()
+        if isinstance(items, list) and items:
+            return items[0]
+        return None
 
+async def get_series_by_tmdb(tmdb_id: int) -> Optional[Dict[str, Any]]:
+    if not tmdb_id:
+        return None
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        r = await c.get(f"{SONARR_URL}/api/v3/series",
+                        params={"tmdbId": tmdb_id},
+                        headers=_headers())
+        r.raise_for_status()
+        items = r.json()
+        if isinstance(items, list) and items:
+            return items[0]
+        return None
 
-async def find_episode(series_id: int, season: int, episode: int) -> Optional[dict]:
-    """Find a single episode object by season/episode numbers."""
-    async with _client() as c:
-        r = await c.get("/api/v3/episode", params={"seriesId": series_id, "seasonNumber": season})
+async def get_episode(series_id: int, season: int, episode: int) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        r = await c.get(f"{SONARR_URL}/api/v3/episode",
+                        params={"seriesId": series_id},
+                        headers=_headers())
         r.raise_for_status()
         eps = r.json() or []
-        for e in eps:
-            if e.get("seasonNumber") == season and e.get("episodeNumber") == episode:
-                return e
+        for ep in eps:
+            if ep.get("seasonNumber") == season and ep.get("episodeNumber") == episode:
+                return ep
         return None
 
-
-async def delete_episode_file_for_episode(episode_id: int) -> int:
-    """Delete file for a single episode if present. Returns 1 if a file was deleted, else 0."""
-    async with _client() as c:
-        r = await c.get(f"/api/v3/episode/{episode_id}")
+async def delete_episode_files(series_id: int, episode_ids: List[int]) -> int:
+    """Delete files for the provided episode ids. Returns count deleted files."""
+    if not episode_ids:
+        return 0
+    deleted = 0
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        r = await c.get(f"{SONARR_URL}/api/v3/episodefile",
+                        params={"seriesId": series_id},
+                        headers=_headers())
         r.raise_for_status()
-        ep = r.json() or {}
-        file_id = ep.get("episodeFileId")
-        if file_id:
-            dr = await c.delete(f"/api/v3/episodefile/{file_id}")
-            dr.raise_for_status()
-            return 1
-    return 0
+        files = r.json() or []
+        ids_to_delete: List[int] = []
+        for f in files:
+            if f.get("episodeId") in episode_ids:
+                fid = f.get("id")
+                if fid:
+                    ids_to_delete.append(fid)
+        for fid in ids_to_delete:
+            try:
+                rr = await c.delete(f"{SONARR_URL}/api/v3/episodefile/{fid}", headers=_headers())
+                rr.raise_for_status()
+                deleted += 1
+            except httpx.HTTPStatusError as e:
+                log.info("Sonarr failed to delete episodefile %s: %s", fid, e)
+    return deleted
 
-
-async def trigger_episode_search(episode_id: int) -> None:
-    """Run EpisodeSearch for the given episode id (episode-only search)."""
-    async with _client() as c:
-        payload = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
-        r = await c.post("/api/v3/command", json=payload)
+async def trigger_episode_search(episode_ids: List[int]) -> None:
+    if not episode_ids:
+        return
+    payload = {"name": "EpisodeSearch", "episodeIds": episode_ids}
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        r = await c.post(f"{SONARR_URL}/api/v3/command",
+                         json=payload, headers=_headers())
         r.raise_for_status()
 
-
-async def queue_has_episode(series_id: int, episode_id: int) -> bool:
-    async with _client() as c:
-        r = await c.get(
-            "/api/v3/queue",
-            params={
-                "page": 1,
-                "pageSize": 50,
-                "sortDirection": "ascending",
-                "includeUnknownSeriesItems": "true",
-            },
-        )
+async def latest_grab_timestamp(series_id: int) -> Optional[datetime]:
+    """Timestamp of latest grabbed for the series (handles v3/v4)."""
+    async with httpx.AsyncClient(timeout=SONARR_HTTP_TIMEOUT) as c:
+        # Preferred in newer Sonarr
+        r = await c.get(f"{SONARR_URL}/api/v3/history/series",
+                        params={"seriesId": series_id, "page": 1, "pageSize": 50, "sortDirection": "descending"},
+                        headers=_headers())
+        if r.status_code == 404:
+            # Fallback for older builds
+            r = await c.get(f"{SONARR_URL}/api/v3/history",
+                            params={"seriesId": series_id, "page": 1, "pageSize": 50, "sortDirection": "descending"},
+                            headers=_headers())
         r.raise_for_status()
-        data = r.json() or {}
-        items = data.get("records") or data if isinstance(data, list) else []
-        for it in items:
-            if it.get("seriesId") == series_id:
-                # Some Sonarr items have "episode" or "episodeId", others have "episodeIds"
-                if it.get("episodeId") == episode_id:
-                    return True
-                ids = it.get("episodeIds") or []
-                if isinstance(ids, list) and episode_id in ids:
-                    return True
-                ep = it.get("episode") or {}
-                if ep.get("id") == episode_id:
-                    return True
-        return False
-
-
-async def latest_episode_grab(series_id: int, episode_id: int) -> Optional[datetime]:
-    """Return latest grabbed timestamp for a specific episode in a series."""
-    async with _client() as c:
-        r = await c.get(
-            "/api/v3/history/series",
-            params={
-                "seriesId": series_id,
-                "page": 1,
-                "pageSize": 25,
-                "sortDirection": "descending",
-            },
-        )
-        r.raise_for_status()
-        data = r.json() or {}
-        records = data.get("records") or data if isinstance(data, list) else []
+        data = r.json()
+        records = data.get("records") if isinstance(data, dict) else (data or [])
+        latest = None
         for rec in records:
-            if (rec.get("eventType") or "").lower() == "grabbed":
-                # Grab events include episodeId (single) or episodeIds (array)
-                if rec.get("episodeId") == episode_id:
-                    ts = rec.get("date") or rec.get("eventDate")
-                    if ts:
-                        try:
-                            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        except Exception:
-                            pass
-                ids = rec.get("episodeIds") or []
-                if isinstance(ids, list) and episode_id in ids:
-                    ts = rec.get("date") or rec.get("eventDate")
-                    if ts:
-                        try:
-                            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        except Exception:
-                            pass
-        return None
-
-
-async def wait_for_episode_grab(series_id: int, episode_id: int, baseline: Optional[datetime], total_sec: int, poll_sec: int) -> bool:
-    deadline = datetime.utcnow().timestamp() + total_sec
-    while datetime.utcnow().timestamp() < deadline:
-        if await queue_has_episode(series_id, episode_id):
-            return True
-        latest = await latest_episode_grab(series_id, episode_id)
-        if latest and (not baseline or latest > baseline):
-            return True
-        await asyncio.sleep(poll_sec)
-    return False
+            if str(rec.get("eventType","")).lower() != "grabbed":
+                continue
+            ts = _ts_from_iso(rec.get("date"))
+            if ts and (not latest or ts > latest):
+                latest = ts
+        return latest
