@@ -84,46 +84,70 @@ def _deep_iter(obj: Any):
             yield from _deep_iter(v)
 
 
+def _to_int(val: Any) -> Optional[int]:
+    try:
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        return int(s)
+    except Exception:
+        return None
+
+
 def _extract_issue_id(payload: Dict[str, Any]) -> Optional[int]:
-    # Preferred: subject:{type:"issue", id:n}
-    subj = payload.get("subject")
-    if isinstance(subj, dict) and subj.get("type") == "issue" and "id" in subj:
-        try:
-            return int(subj["id"])
-        except Exception:
-            pass
+    # Exact template you provided: issue.issue_id
+    issue = payload.get("issue") or {}
+    iid = _to_int(issue.get("issue_id"))
+    if iid is not None:
+        return iid
 
-    # Nested ... issue: { id: ... }
+    # Other possibilities we’ve seen
+    iid = _to_int(issue.get("id"))
+    if iid is not None:
+        return iid
+
+    # Generic fallbacks anywhere
     for node in _deep_iter(payload):
-        if isinstance(node, dict) and "issue" in node and isinstance(node["issue"], dict):
-            iid = node["issue"].get("id")
-            try:
-                if iid is not None:
-                    return int(iid)
-            except Exception:
-                pass
-
-    # Fallback: explicit issueId anywhere
-    for node in _deep_iter(payload):
-        if isinstance(node, dict) and "issueId" in node:
-            try:
-                return int(node["issueId"])
-            except Exception:
-                pass
-
+        if not isinstance(node, dict):
+            continue
+        if "issueId" in node:
+            iid = _to_int(node.get("issueId"))
+            if iid is not None:
+                return iid
+        if "issue_id" in node:
+            iid = _to_int(node.get("issue_id"))
+            if iid is not None:
+                return iid
+        if "id" in node and (node.get("type") == "issue" or node.get("subject") == "issue"):
+            iid = _to_int(node.get("id"))
+            if iid is not None:
+                return iid
     return None
 
 
 def _extract_media_type(payload: Dict[str, Any]) -> Optional[str]:
+    # Exact template: media.media_type
+    media = payload.get("media") or {}
+    mt = media.get("media_type")
+    if isinstance(mt, str) and mt.strip():
+        return mt.lower()
+
+    # Fallbacks
+    mt = media.get("mediaType") or payload.get("media_type") or payload.get("mediaType")
+    if isinstance(mt, str) and mt.strip():
+        return mt.lower()
+
+    # Deep fallback
     for node in _deep_iter(payload):
         if not isinstance(node, dict):
             continue
-        mt = node.get("mediaType")
-        if isinstance(mt, str) and mt.strip():
-            return mt.lower()
-        media = node.get("media")
-        if isinstance(media, dict):
-            mt = media.get("mediaType")
+        m = node.get("media")
+        if isinstance(m, dict):
+            mt = m.get("media_type") or m.get("mediaType")
             if isinstance(mt, str) and mt.strip():
                 return mt.lower()
     return None
@@ -140,19 +164,23 @@ def _parse_sxe_from_string(s: str) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _extract_season_episode(doc: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    # numeric fields
+    # Your template: issue.affected_season / issue.affected_episode
+    issue = (doc or {}).get("issue") or {}
+    s = _to_int(issue.get("affected_season"))
+    e = _to_int(issue.get("affected_episode"))
+    if s is not None and e is not None:
+        return s, e
+
+    # Common alternates
     for node in _deep_iter(doc):
         if not isinstance(node, dict):
             continue
-        s = node.get("affectedSeason") or node.get("season") or node.get("seasonNumber")
-        e = node.get("affectedEpisode") or node.get("episode") or node.get("episodeNumber")
-        try:
-            if s is not None and e is not None:
-                return int(s), int(e)
-        except Exception:
-            pass
+        s = _to_int(node.get("season")) or _to_int(node.get("seasonNumber"))
+        e = _to_int(node.get("episode")) or _to_int(node.get("episodeNumber"))
+        if s is not None and e is not None:
+            return s, e
 
-    # encoded SxxExx
+    # SxxExx encoded strings
     for node in _deep_iter(doc):
         if not isinstance(node, dict):
             continue
@@ -201,6 +229,38 @@ def _classify_bucket(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def _extract_ids(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    # Respect your template first
+    media = payload.get("media") or {}
+    tmdb = _to_int(media.get("tmdbId"))
+    tvdb = _to_int(media.get("tvdbId"))
+    imdb = None  # not present in your template
+
+    # Fall back to other shapes if missing
+    if tmdb is None or tvdb is None:
+        for node in _deep_iter(payload):
+            if not isinstance(node, dict):
+                continue
+            m = node.get("media")
+            if isinstance(m, dict):
+                tmdb = tmdb if tmdb is not None else _to_int(m.get("tmdbId"))
+                tvdb = tvdb if tvdb is not None else _to_int(m.get("tvdbId"))
+                imdb = imdb or m.get("imdbId")
+    return tmdb, tvdb, imdb
+
+
+def _extract_comment_text(payload: Dict[str, Any]) -> Optional[str]:
+    comment = payload.get("comment") or {}
+    text = comment.get("comment_message") or comment.get("message") or comment.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    # fallback: sometimes the top-level "message" contains the human text
+    top = payload.get("message")
+    if isinstance(top, str) and top.strip():
+        return top
+    return None
+
+
 # -----------------------------------------------------------------------------
 # Main entry
 # -----------------------------------------------------------------------------
@@ -209,9 +269,9 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     issue_id = _extract_issue_id(payload)
     media_type = _extract_media_type(payload) or ""
-    tmdb = tvdb = imdb = None
+    tmdb, tvdb, imdb = _extract_ids(payload)
 
-    # Fetch full issue (source of truth)
+    # Fetch full issue (source of truth) if we have an id
     issue_json = None
     if issue_id:
         try:
@@ -219,27 +279,19 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.info("Jellyseerr: fetch issue %s failed: %s", issue_id, e)
 
+    # Prefer media type from the fetched issue if present
     if issue_json:
         media_type = (issue_json.get("mediaType") or media_type or "").lower()
-        tmdb = issue_json.get("tmdbId") or (issue_json.get("media") or {}).get("tmdbId")
-        tvdb = issue_json.get("tvdbId") or (issue_json.get("media") or {}).get("tvdbId")
-        imdb = issue_json.get("imdbId") or (issue_json.get("media") or {}).get("imdbId")
-
-    # Fallbacks from raw payload
-    if tmdb is None or tvdb is None or imdb is None:
-        for node in _deep_iter(payload):
-            if isinstance(node, dict):
-                media = node.get("media")
-                if isinstance(media, dict):
-                    tmdb = tmdb or media.get("tmdbId")
-                    tvdb = tvdb or media.get("tvdbId")
-                    imdb = imdb or media.get("imdbId")
 
     # Determine bucket from the latest human comment
-    comment_text = (payload.get("comment") or {}).get("message") or (payload.get("comment") or {}).get("text")
+    comment_text = _extract_comment_text(payload)
     if issue_json and not comment_text:
         comment_text = _last_human_comment_text(issue_json)
+    if comment_text:
+        log.info("Jellyseerr: last comment on issue %s: %r", issue_id, comment_text)
     bucket = _classify_bucket(comment_text)
+    if comment_text:
+        log.info("Keyword scan: %r -> bucket=%s", comment_text, bucket)
 
     # Season/Episode for series
     season, episode = _extract_season_episode(issue_json or payload)
@@ -264,7 +316,9 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             "subtitle: missing subs, no subtitles, bad subtitles, wrong subs, subs out of sync"
         )
         if comment_text and not is_our_comment(comment_text) and issue_id:
-            await jelly_comment(issue_id, _ensure_prefixed(tip), force_prefix=False)
+            msg = _ensure_prefixed(tip)
+            log.info("Outgoing coaching comment: %r", msg)
+            await jelly_comment(issue_id, msg, force_prefix=False)
             _arm_cooldown(issue_id)
         return {"coached": True}
 
@@ -311,6 +365,7 @@ async def _handle_movie(issue_id: Optional[int], tmdb: Optional[int], imdb: Opti
         tmpl = (cfg.MSG_MOVIE_REPLACED_AND_GRABBED if deleted else cfg.MSG_MOVIE_SEARCH_ONLY_GRABBED) \
                or "{title}: new download grabbed. Closing this issue."
         msg = _ensure_prefixed(tmpl.format(title=title, deleted=deleted))
+        log.info("Outgoing comment: %r", msg)
         await jelly_comment(issue_id, msg, force_prefix=False)
         if _close_issues_enabled():
             try:
@@ -350,6 +405,7 @@ async def _handle_series(issue_id: Optional[int], tvdb: Optional[int], season: i
         tmpl = (cfg.MSG_TV_REPLACED_AND_GRABBED if deleted else cfg.MSG_TV_SEARCH_ONLY_GRABBED) \
                or "{title} S{season:02d}E{episode:02d}: new download grabbed. Closing this issue."
         msg = _ensure_prefixed(tmpl.format(title=title, season=season, episode=episode, deleted=deleted))
+        log.info("Outgoing comment: %r", msg)
         await jelly_comment(issue_id, msg, force_prefix=False)
         if _close_issues_enabled():
             try:
