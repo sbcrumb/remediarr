@@ -24,23 +24,8 @@ RADARR_VERIFY_POLL_SEC = int(os.getenv("RADARR_VERIFY_POLL_SEC", "5"))
 SONARR_VERIFY_GRAB_SEC = int(os.getenv("SONARR_VERIFY_GRAB_SEC", "60"))
 SONARR_VERIFY_POLL_SEC = int(os.getenv("SONARR_VERIFY_POLL_SEC", "5"))
 
-# Messages
-MSG_MOVIE_REPLACED_AND_GRABBED = os.getenv(
-    "MSG_MOVIE_REPLACED_AND_GRABBED",
-    "{title}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
-)
-MSG_MOVIE_SEARCH_ONLY_GRABBED = os.getenv(
-    "MSG_MOVIE_SEARCH_ONLY_GRABBED",
-    "{title}: new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
-)
-MSG_TV_REPLACED_AND_GRABBED = os.getenv(
-    "MSG_TV_REPLACED_AND_GRABBED",
-    "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
-)
-MSG_TV_SEARCH_ONLY_GRABBED = os.getenv(
-    "MSG_TV_SEARCH_ONLY_GRABBED",
-    "{title} S{season:02d}E{episode:02d}: new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
-)
+# Messages - Simple and clean
+MSG_SUCCESS = os.getenv("MSG_SUCCESS", "closed")
 
 # Keyword buckets (lower-cased sets)
 def _csv(name: str) -> List[str]:
@@ -455,17 +440,10 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "detail": "ignored: movie not in radarr"}
 
         log.info("Processing movie %s (%s) with bucket: %s", movie["id"], movie.get("title"), bucket)
-
-        removed = 0
-        if bucket in ("audio", "video", "subtitle", "wrong"):
-            log.info("Deleting movie files for movie %s", movie["id"])
-            removed = await R.delete_moviefiles(movie["id"])
-            log.info("Deleted %s movie files", removed)
-
-        # Start the verification and close process
-        await _verify_radarr_and_close(issue_id, movie, removed)
+        
+        await _handle_movie(issue_id, movie, bucket)
         _bump_cooldown(issue_id)
-        return {"ok": True, "detail": f"movie handled: {bucket}", "removed": removed}
+        return {"ok": True, "detail": f"movie handled: {bucket}"}
 
     # === TV ===
     elif media_type in ("tv", "series"):
@@ -489,16 +467,9 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Processing TV series %s (%s) S%02dE%02d with bucket: %s", 
                  series_id, series.get("title"), season, episode, bucket)
 
-        removed = 0
-        if bucket in ("audio", "video", "subtitle"):
-            log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
-            removed = await S.delete_episodefiles(series_id, episode_ids)
-            log.info("Deleted %s episode files", removed)
-
-        # Start the verification and close process
-        await _verify_sonarr_and_close(issue_id, series, season, episode, removed, episode_ids)
+        await _handle_tv(issue_id, series, season, episode, episode_ids, bucket)
         _bump_cooldown(issue_id)
-        return {"ok": True, "detail": f"tv handled: {bucket}", "removed": removed}
+        return {"ok": True, "detail": f"tv handled: {bucket}"}
 
     log.info("Unknown media_type=%r; ignoring.", media_type)
     return {"ok": True, "detail": "ignored: unknown media_type"}
