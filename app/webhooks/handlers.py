@@ -121,12 +121,20 @@ def _walk_for_season_episode(o: Any) -> Tuple[Optional[int], Optional[int]]:
             return
         if isinstance(node, dict):
             for k, v in node.items():
+                # Be more specific about what keys we accept
                 if s_found is None and _key_looks_like(k, "season"):
                     sv = _maybe_int_from_obj(v)
-                    s_found = sv if sv is not None else s_found
+                    # Sanity check: seasons should be 1-50
+                    if sv is not None and 1 <= sv <= 50:
+                        s_found = sv
                 if e_found is None and _key_looks_like(k, "episode"):
                     ev = _maybe_int_from_obj(v)
-                    e_found = ev if ev is not None else e_found
+                    # Sanity check: episodes should be 1-999, not series IDs (which are often 100+)
+                    if ev is not None and 1 <= ev <= 999:
+                        # Additional check: if this looks like a series ID (>100), skip it
+                        if ev > 100 and k.lower() in ["id", "seriesid", "series_id"]:
+                            continue
+                        e_found = ev
                 _walk(v)
         elif isinstance(node, list):
             for it in node:
@@ -171,12 +179,14 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
 
     # Try explicit keys first - handle both string and int values
     season_candidates = [
+        issue.get("problemSeason"),  # This is the correct field name!
         issue.get("affected_season"), 
         issue.get("affectedSeason"),
         media.get("seasonNumber"), 
         media.get("season")
     ]
     episode_candidates = [
+        issue.get("problemEpisode"),  # This is the correct field name!
         issue.get("affected_episode"), 
         issue.get("affectedEpisode"),
         media.get("episodeNumber"), 
@@ -220,54 +230,33 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
 
     log.info("After explicit extraction: season=%s, episode=%s", season, episode)
 
-    # Fallback: parse from text
-    if season is None or episode is None:
-        text = " ".join([
-            str(payload.get("subject") or ""),
-            str(issue.get("issue_type") or ""),
-            str(issue.get("issue_status") or ""),
-            str(payload.get("message") or ""),
-            str(comment.get("comment_message") or ""),
-            str(comment.get("message") or "")
-        ])
-        s2, e2 = _extract_season_episode_from_text(text)
-        season = season if season is not None else s2
-        episode = episode if episode is not None else e2
-        if s2 or e2:
-            log.info("After text parsing: season=%s, episode=%s", season, episode)
+    # If we got both from explicit extraction, skip fallbacks
+    if season is not None and episode is not None:
+        log.info("Found season/episode from explicit extraction: S%02dE%02d", season, episode)
+    else:
+        # Fallback: parse from text
+        if season is None or episode is None:
+            text = " ".join([
+                str(payload.get("subject") or ""),
+                str(issue.get("issue_type") or ""),
+                str(issue.get("issue_status") or ""),
+                str(payload.get("message") or ""),
+                str(comment.get("comment_message") or ""),
+                str(comment.get("message") or "")
+            ])
+            s2, e2 = _extract_season_episode_from_text(text)
+            season = season if season is not None else s2
+            episode = episode if episode is not None else e2
+            if s2 or e2:
+                log.info("After text parsing: season=%s, episode=%s", season, episode)
 
-    # Fallback: walk the entire payload for season/episode
-    if season is None or episode is None:
-        s3, e3 = _walk_for_season_episode(payload)
-        season = season if season is not None else s3
-        episode = episode if episode is not None else e3
-        if s3 or e3:
-            log.info("After payload walk: season=%s, episode=%s", season, episode)
-
-    # Final fallback: fetch issue from Jellyseerr API
-    if (season is None or episode is None) and issue.get("issue_id"):
-        try:
-            full_issue = await jelly_fetch_issue(int(issue.get("issue_id")))
-            # Look for affectedSeason/affectedEpisode in the API response
-            api_season = full_issue.get("affectedSeason")
-            api_episode = full_issue.get("affectedEpisode")
-            
-            if api_season is not None and season is None:
-                try:
-                    season = int(api_season)
-                    log.info("Found season from API: %s", season)
-                except (ValueError, TypeError):
-                    pass
-                    
-            if api_episode is not None and episode is None:
-                try:
-                    episode = int(api_episode)
-                    log.info("Found episode from API: %s", episode)
-                except (ValueError, TypeError):
-                    pass
-                    
-        except Exception as e:
-            log.warning("Failed to fetch issue details: %s", e)
+        # Fallback: walk the entire payload for season/episode
+        if season is None or episode is None:
+            s3, e3 = _walk_for_season_episode(payload)
+            season = season if season is not None else s3
+            episode = episode if episode is not None else e3
+            if s3 or e3:
+                log.info("After payload walk: season=%s, episode=%s", season, episode)
 
     # Get series from Sonarr
     series = await S.get_series_by_tvdb(int(tvdb_id))
@@ -351,6 +340,11 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     log.info("Processing issue %s", issue_id)
 
+    # Skip if issue is already resolved to prevent processing resolved issue webhooks
+    if (payload.get("issue") or {}).get("issue_status") == "RESOLVED":
+        log.info("Issue %s already resolved, skipping", issue_id)
+        return {"ok": True, "detail": "ignored: issue already resolved"}
+
     # Fetch the full issue details and merge with payload
     issue = await jelly_fetch_issue(issue_id)
     
@@ -373,17 +367,67 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     last = await jelly_last_human_comment(issue_id)
     log.info("Jellyseerr: last human comment on issue %s: %r", issue_id, last)
     
+    # Skip if our own comment (prevent loops)
     if is_our_comment(last):
         log.info("Last comment is ours; skipping.")
         return {"ok": True, "detail": "ignored: our comment"}
+    
+    # Skip if this comment was already processed (prevent comment-triggered loops)
+    comment_msg = (payload.get("comment") or {}).get("comment_message", "")
+    if is_our_comment(comment_msg):
+        log.info("Current comment is ours; skipping.")
+        return {"ok": True, "detail": "ignored: processing our own comment"}
 
     # Bucket
     bucket = _bucket_for(last, media_type)
     log.info("Keyword scan: %r -> bucket=%s", last, bucket)
 
-    # No bucket → do nothing
+    # No bucket → coach the user if coaching is enabled
     if not bucket:
         log.info("No actionable keywords found")
+        
+        # Coaching: suggest keywords when none match, based on issue type
+        if COMMENT_ON_ACTION and issue_id:
+            # Get the issue type from the enriched payload
+            issue_type = (enriched_payload.get("issue") or {}).get("issue_type", "").lower()
+            
+            if media_type == "movie":
+                if issue_type == "video":
+                    keywords = list(MOV_VIDEO)[:5]
+                elif issue_type == "audio":
+                    keywords = list(MOV_AUDIO)[:5]
+                elif issue_type == "subtitle":
+                    keywords = list(MOV_SUBS)[:5]
+                elif issue_type == "other":
+                    keywords = list(MOV_OTHER)[:5]
+                else:
+                    # If issue type unknown, show a mix but prioritize common ones
+                    keywords = list(MOV_VIDEO)[:2] + list(MOV_AUDIO)[:2] + list(MOV_WRONG)[:2]
+                    
+            elif media_type in ("tv", "series"):
+                if issue_type == "video":
+                    keywords = list(TV_VIDEO)[:5]
+                elif issue_type == "audio":
+                    keywords = list(TV_AUDIO)[:5]
+                elif issue_type == "subtitle":
+                    keywords = list(TV_SUBS)[:5]
+                elif issue_type == "other":
+                    keywords = list(TV_OTHER)[:5]
+                else:
+                    # If issue type unknown, show a mix but prioritize common ones
+                    keywords = list(TV_VIDEO)[:2] + list(TV_AUDIO)[:2] + list(TV_SUBS)[:2]
+            else:
+                keywords = ["specific issue keywords"]
+            
+            if keywords:
+                keyword_list = "', '".join(keywords)
+                coach_msg = f"{PREFIX} Tip for {issue_type} issues: Include keywords like '{keyword_list}' for automatic fixes."
+            else:
+                coach_msg = f"{PREFIX} Tip: Include specific {issue_type} issue keywords for automatic fixes."
+            
+            log.info("Posting coaching comment for missing %s keywords", issue_type)
+            await jelly_comment(issue_id, coach_msg)
+        
         return {"ok": True, "detail": "ignored: no actionable keywords"}
 
     # Cooldown guard
