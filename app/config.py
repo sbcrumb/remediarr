@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -12,22 +13,34 @@ BOT_PREFIX = "[Remediarr]"
 
 def _detect_version() -> str:
     """
-    Priority:
-      1) REMEDIARR_VERSION env (e.g., dev-<sha> baked at build time)
-      2) VERSION file at repo root (release/main builds)
-      3) fallback 'dev'
-    NOTE: We do NOT call `git` at runtime (containers often lack .git).
+    Version detection priority:
+      1) VERSION file (for main/prod releases)
+      2) Git SHA (for dev branch) 
+      3) REMEDIARR_VERSION env (for build-time override)
+      4) fallback 'dev'
     """
-    env_v = os.getenv("REMEDIARR_VERSION")
-    if env_v and env_v.strip():
-        return env_v.strip()
-
-    # repo root is two levels up from this file: app/config.py -> app/ -> repo/
+    # First check for VERSION file (production releases)
     vf = Path(__file__).resolve().parents[1] / "VERSION"
     if vf.exists():
         vtxt = vf.read_text(encoding="utf-8").strip()
         if vtxt:
             return vtxt
+
+    # Try git SHA for development
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            cwd=Path(__file__).resolve().parents[1]
+        ).decode().strip()
+        return f"dev-{sha}"
+    except Exception:
+        pass
+
+    # Environment override (build-time)
+    env_v = os.getenv("REMEDIARR_VERSION")
+    if env_v and env_v.strip():
+        return env_v.strip()
 
     return "dev"
 
@@ -36,9 +49,9 @@ class Settings(BaseSettings):
     # ===== App / Server =====
     APP_NAME: str = "Remediarr"
     VERSION: str = _detect_version()
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    APP_HOST: str = os.getenv("APP_HOST", "0.0.0.0")
-    APP_PORT: int = int(os.getenv("APP_PORT", "8189"))
+    LOG_LEVEL: str = "INFO"
+    APP_HOST: str = "0.0.0.0"
+    APP_PORT: int = 8189
 
     # ===== Webhook security =====
     WEBHOOK_SHARED_SECRET: Optional[str] = None   # HMAC "sha256=<hex>" in X-Jellyseerr-Signature
@@ -58,30 +71,20 @@ class Settings(BaseSettings):
     JELLYSEERR_API_KEY: str
 
     # ===== Behavior toggles =====
-    ENABLE_BLOCKLIST: bool = True
-    CLOSE_JELLYSEERR_ISSUES: bool = True
-    ACK_ON_COMMENT_CREATED: bool = True
-
-    # Auto-close message (prefixed automatically)
-    JELLYSEERR_CLOSE_MESSAGE: Optional[str] = None
-
-    # ===== Verify windows =====
-    RADARR_VERIFY_GRAB_SEC: int = 60
-    RADARR_VERIFY_POLL_SEC: int = 5
-    SONARR_VERIFY_GRAB_SEC: int = 60
-    SONARR_VERIFY_POLL_SEC: int = 5
+    JELLYSEERR_CLOSE_ISSUES: bool = True
+    JELLYSEERR_COMMENT_ON_ACTION: bool = True
 
     # ===== Keyword buckets (comma-separated) =====
-    TV_AUDIO_KEYWORDS: str = ""
-    TV_VIDEO_KEYWORDS: str = ""
-    TV_SUBTITLE_KEYWORDS: str = ""
-    TV_OTHER_KEYWORDS: str = ""
+    TV_AUDIO_KEYWORDS: str = "no audio,no sound,missing audio,audio issue,wrong language,not in english"
+    TV_VIDEO_KEYWORDS: str = "no video,video glitch,black screen,stutter,pixelation"
+    TV_SUBTITLE_KEYWORDS: str = "missing subs,no subtitles,bad subtitles,wrong subs,subs out of sync"
+    TV_OTHER_KEYWORDS: str = "buffering,playback error,corrupt file"
 
-    MOVIE_AUDIO_KEYWORDS: str = ""
-    MOVIE_VIDEO_KEYWORDS: str = ""
-    MOVIE_SUBTITLE_KEYWORDS: str = ""
-    MOVIE_OTHER_KEYWORDS: str = ""
-    MOVIE_WRONG_KEYWORDS: str = ""
+    MOVIE_AUDIO_KEYWORDS: str = "no audio,no sound,audio issue,wrong language,not in english"
+    MOVIE_VIDEO_KEYWORDS: str = "no video,video missing,bad video,broken video,black screen"
+    MOVIE_SUBTITLE_KEYWORDS: str = "missing subs,no subtitles,bad subtitles,wrong subs,subs out of sync"
+    MOVIE_OTHER_KEYWORDS: str = "buffering,playback error,corrupt file"
+    MOVIE_WRONG_KEYWORDS: str = "not the right movie,wrong movie,incorrect movie"
 
     # ===== Notifications =====
     APPRISE_URLS: Optional[str] = None
@@ -90,24 +93,12 @@ class Settings(BaseSettings):
     GOTIFY_PRIORITY: int = 5
 
     # ===== Customizable messages =====
-    MSG_MOVIE_REPLACED_AND_GRABBED: Optional[str] = None
-    MSG_TV_REPLACED_AND_GRABBED: Optional[str] = None
-    MSG_MOVIE_SEARCH_ONLY_GRABBED: Optional[str] = None
-    MSG_TV_SEARCH_ONLY_GRABBED: Optional[str] = None
-
-    MSG_TV_AUDIO_HANDLED: Optional[str] = None
-    MSG_TV_VIDEO_HANDLED: Optional[str] = None
-    MSG_TV_SUB_HANDLED: Optional[str] = None
-    MSG_TV_OTHER_COACH: Optional[str] = None
-
-    MSG_MOVIE_AUDIO_HANDLED: Optional[str] = None
-    MSG_MOVIE_VIDEO_HANDLED: Optional[str] = None
-    MSG_MOVIE_SUB_HANDLED: Optional[str] = None
-    MSG_MOVIE_WRONG_HANDLED: Optional[str] = None
-    MSG_MOVIE_OTHER_COACH: Optional[str] = None
-
-    MSG_KEYWORD_COACH: Optional[str] = None
+    MSG_MOVIE_SUCCESS: Optional[str] = None
+    MSG_TV_SUCCESS: Optional[str] = None
     MSG_AUTOCLOSE_FAIL: Optional[str] = None
+
+    # ===== Cooldown =====
+    REMEDIARR_ISSUE_COOLDOWN_SEC: int = 90
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
