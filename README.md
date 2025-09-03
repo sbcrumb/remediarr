@@ -1,8 +1,5 @@
 # Remediarr
 
-[![Build & Publish to GHCR](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr-dev.yml/badge.svg)](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr-dev.yml)
-[![Container image](https://img.shields.io/badge/GHCR-ghcr.io%2Fsbcrumb%2Fremediarr-blue)](https://github.com/sbcrumb/remediarr/pkgs/container/remediarr)
-
 **Automated issue resolution for Jellyseerr via Sonarr & Radarr webhooks**
 
 > ⚠️ **Work in Progress**: Remediarr is under active development. Configuration options, API endpoints, and behavior may change between versions. Please check the changelog and update your configuration when upgrading. Feedback and bug reports are welcome!
@@ -279,5 +276,3 @@ If Remediarr saves you time managing media issues:
 
 - **GitHub Sponsors**: [sponsor sbcrumb](https://github.com/sponsors/sbcrumb)
 - **Bitcoin**: `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`
-
-Thank you for supporting open source development!
