@@ -19,9 +19,9 @@ services:
     ports:
       - "8189:8189"
 
-    # Health check (optional but helpful)
+    # Healthcheck for container status
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8189/"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8189/"]
       interval: 30s
       timeout: 5s
       retries: 3
