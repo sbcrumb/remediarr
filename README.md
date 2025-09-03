@@ -1,240 +1,278 @@
-[![Build & Publish to GHCR](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr-main.yml/badge.svg)](https://github.com/sbcrumb/remediarr/actions/workflows/ghcr-main.yml)
-[![Container image](https://img.shields.io/badge/GHCR-ghcr.io%2Fsbcrumb%2Fremediarr-blue)](https://github.com/sbcrumb/remediarr/pkgs/container/remediarr)
-
 # Remediarr
 
-Remediarr is a lightweight webhook service that listens to **Jellyseerr issue webhooks** and automatically remediates common problems.
+**Automated issue resolution for Jellyseerr via Sonarr & Radarr webhooks**
 
-✨ **What it does**
-- **TV Issues (Audio / Video / Subtitles):** Delete the bad episode file and trigger a re-download.
-- **Movie Issues (Audio / Video / Subtitles):** Mark the last bad grab as failed, delete bad file(s), and trigger a new search.
-- **Wrong Movie Reports:** Blocklist + delete the last bad grab, with optional “only search if digitally released” logic.
-- **Coaching Mode:** If a user doesn’t include recognizable keywords, Remediarr leaves a helpful comment explaining what to do.
-- **Gotify Notifications:** Optional push messages when an action is taken.
-- **Customization:** All keywords, comments, and behaviors are configurable in `.env`.
+> ⚠️ **Work in Progress**: Remediarr is under active development. Configuration options, API endpoints, and behavior may change between versions. Please check the changelog and update your configuration when upgrading. Feedback and bug reports are welcome!
 
-##Settings Note
-Please set the webhook fire settings just to Issue Reported for now. If you select Comment resolved etc it will create a loop condition.
-Working on correcting it.
-<img width="913" height="690" alt="image" src="https://github.com/user-attachments/assets/5a3058c1-e26b-44dd-a7dc-9a32c5b94049" />
+Remediarr is a lightweight webhook service that automatically fixes common media issues reported through Jellyseerr. When users report problems like "no audio" or "wrong movie", Remediarr detects the keywords, deletes problematic files, triggers new downloads, and closes the issue—all without manual intervention.
 
+## Features
+
+- **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
+- **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
+- **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
+- **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
+- **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
+- **📱 Notifications**: Optional Gotify and Apprise integration
+- **🔐 Security**: HMAC signature verification and custom header authentication
+- **⚡ Performance**: Built with FastAPI for speed and reliability
+
+## How It Works
+
+1. **User reports issue** in Jellyseerr: "no audio in S02E05"
+2. **Jellyseerr sends webhook** to Remediarr with issue details
+3. **Remediarr processes** the comment, detects "audio" keyword
+4. **Finds the episode** in Sonarr using TVDB ID and season/episode
+5. **Deletes bad file** and triggers new download in Sonarr
+6. **Comments on issue**: "S02E05: replaced file; new download grabbed"
+7. **Closes the issue** automatically
 
 ## Quick Start
 
-### 1. Clone & prepare
-```bash
-git clone https://github.com/<your-username>/remediarr.git
-cd remediarr
-cp .env.example .env
-# Edit .env with your API keys, URLs, and preferred keywords/messages
+### Docker Compose (Recommended)
+
+```yaml
+version: '3.8'
+services:
+  remediarr:
+    image: ghcr.io/sbcrumb/remediarr:latest
+    container_name: remediarr
+    ports:
+      - "8189:8189"
+    environment:
+      # Required - Your service URLs and API keys
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=your-sonarr-api-key
+      - RADARR_URL=http://radarr:7878  
+      - RADARR_API_KEY=your-radarr-api-key
+      - JELLYSEERR_URL=http://jellyseerr:5055
+      - JELLYSEERR_API_KEY=your-jellyseerr-api-key
+      
+      # Optional - Notifications
+      - GOTIFY_URL=https://gotify.example.com
+      - GOTIFY_TOKEN=your-gotify-token
+      
+      # Optional - Security
+      - WEBHOOK_SHARED_SECRET=your-shared-secret
+      
+    restart: unless-stopped
 ```
 
-### 2. Build & run locally
+### Manual Docker
+
 ```bash
-docker build -t remediarr:local .
-docker run --rm -p 8189:8189 --env-file .env remediarr:local
+docker run -d \
+  --name remediarr \
+  -p 8189:8189 \
+  -e SONARR_URL=http://sonarr:8989 \
+  -e SONARR_API_KEY=your-api-key \
+  -e RADARR_URL=http://radarr:7878 \
+  -e RADARR_API_KEY=your-api-key \
+  -e JELLYSEERR_URL=http://jellyseerr:5055 \
+  -e JELLYSEERR_API_KEY=your-api-key \
+  ghcr.io/sbcrumb/remediarr:latest
 ```
 
-### 3. Or use Docker Compose
-```bash
-docker compose -f docker-compose.example.yml up -d --build
-```
+## Jellyseerr Configuration
 
----
+Configure webhooks in **Jellyseerr → Settings → Notifications → Webhooks**:
 
-## Jellyseerr Setup
+### Webhook Settings
+- **Webhook URL**: `http://your-server:8189/webhook/jellyseerr`
+- **Request Method**: `POST`
+- **Notification Types**: Check **only** "Issue Reported" (other types will cause loops)
 
-In **Jellyseerr → Settings → Notifications → Webhooks**:
-
-- **URL:**
-  ```
-  http://<your-server>:8189/webhook/jellyseerr
-  ```
-
-- **Method:** `POST`
-
-- **Payload:** use this JSON template (make sure season/episode are included when available)
-  ```json
-  {
-    "event": "{{event}}",
-    "subject": "{{subject}}",
-    "message": "{{message}}",
-    "media": {
-      "media_type": "{{media_type}}",
-      "tmdbId": "{{media_tmdbid}}",
-      "tvdbId": "{{media_tvdbid}}",
-      "seasonNumber": "{{season_number}}",
-      "episodeNumber": "{{episode_number}}"
-    },
-    "issue": {
-      "issue_id": "{{issue_id}}",
-      "issue_type": "{{issue_type}}",
-      "issue_status": "{{issue_status}}",
-      "affected_season": "{{affected_season}}",
-      "affected_episode": "{{affected_episode}}",
-      "season": "{{season}}",
-      "episode": "{{episode}}"
-    },
-    "comment": {
-      "comment_message": "{{comment_message}}"
-    }
+### JSON Payload
+```json
+{
+  "event": "{{event}}",
+  "subject": "{{subject}}",
+  "message": "{{message}}",
+  "media": {
+    "media_type": "{{media_type}}",
+    "tmdbId": "{{media_tmdbid}}",
+    "tvdbId": "{{media_tvdbid}}",
+    "seasonNumber": "{{season_number}}",
+    "episodeNumber": "{{episode_number}}"
+  },
+  "issue": {
+    "issue_id": "{{issue_id}}",
+    "issue_type": "{{issue_type}}",
+    "issue_status": "{{issue_status}}",
+    "problemSeason": "{{affected_season}}",
+    "problemEpisode": "{{affected_episode}}"
+  },
+  "comment": {
+    "comment_message": "{{comment_message}}"
   }
-  ```
+}
+```
 
-- **Secret/Header (optional):**  
-  If you configure a shared secret or custom header in Jellyseerr, mirror it in `.env`.
+> **Important**: Only enable "Issue Reported" notifications to prevent processing loops
 
----
+## Configuration
 
-## Environment Variables
+Remediarr is configured entirely through environment variables. See the [complete configuration guide](.env.example) for all options.
 
-See `.env.example` for all available options. Highlights:
+### Required Settings
 
-- **Web server**
-  ```
-  APP_HOST=0.0.0.0
-  APP_PORT=8189
-  LOG_LEVEL=INFO
-  ```
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SONARR_URL` | Sonarr base URL | `http://sonarr:8989` |
+| `SONARR_API_KEY` | Sonarr API key | `abc123...` |
+| `RADARR_URL` | Radarr base URL | `http://radarr:7878` |
+| `RADARR_API_KEY` | Radarr API key | `def456...` |
+| `JELLYSEERR_URL` | Jellyseerr base URL | `http://jellyseerr:5055` |
+| `JELLYSEERR_API_KEY` | Jellyseerr API key | `ghi789...` |
 
-- **Sonarr & Radarr**
-  ```
-  SONARR_URL=http://sonarr:8989
-  SONARR_API_KEY=your-sonarr-api-key
+### Keyword Customization
 
-  RADARR_URL=http://radarr:7878
-  RADARR_API_KEY=your-radarr-api-key
-  ```
+You can customize which keywords trigger each action type:
 
-- **Jellyseerr**
-  ```
-  JELLYSEERR_URL=http://jellyseerr:5055
-  JELLYSEERR_API_KEY=your-jellyseerr-api-key
-  JELLYSEERR_COACH_REPORTERS=true
-  JELLYSEERR_COMMENT_ON_ACTION=true
-  JELLYSEERR_CLOSE_ISSUES=false
-  ```
+```bash
+# TV Show Keywords
+TV_AUDIO_KEYWORDS="no audio,no sound,missing audio,audio issue,wrong language"
+TV_VIDEO_KEYWORDS="no video,video glitch,black screen,stutter,pixelation"  
+TV_SUBTITLE_KEYWORDS="missing subs,no subtitles,bad subtitles,wrong subs"
+TV_OTHER_KEYWORDS="buffering,playback error,corrupt file"
 
-- **TMDB (for digital release checks)**
-  ```
-  TMDB_API_KEY=your-tmdb-api-key
-  SEARCH_ONLY_IF_DIGITAL_RELEASE=true
-  ```
+# Movie Keywords  
+MOVIE_AUDIO_KEYWORDS="no audio,no sound,audio issue,wrong language"
+MOVIE_VIDEO_KEYWORDS="no video,video missing,bad video,black screen"
+MOVIE_SUBTITLE_KEYWORDS="missing subs,no subtitles,bad subtitles"
+MOVIE_OTHER_KEYWORDS="buffering,playback error,corrupt file"
+MOVIE_WRONG_KEYWORDS="wrong movie,incorrect movie,not the right movie"
+```
 
-- **Gotify notifications (optional)**
-  ```
-  GOTIFY_URL=https://gotify.example.com
-  GOTIFY_TOKEN=your-gotify-token
-  GOTIFY_PRIORITY=5
-  ```
+### Security Options
 
-- **Keyword defaults**
-  ```
-  TV_AUDIO_KEYWORDS=no audio,no sound,missing audio,audio issue
-  TV_VIDEO_KEYWORDS=no video,video glitch,black screen,stutter,pixelation
-  TV_SUBTITLE_KEYWORDS=missing subs,no subtitles,bad subtitles,wrong subs,subs out of sync
-  TV_OTHER_KEYWORDS=buffering,playback error,corrupt file
+```bash
+# HMAC signature verification (recommended)
+WEBHOOK_SHARED_SECRET="your-secret-key"
 
-  MOVIE_AUDIO_KEYWORDS=no audio,no sound,audio issue
-  MOVIE_VIDEO_KEYWORDS=no video,video missing,bad video,broken video,black screen
-  MOVIE_SUBTITLE_KEYWORDS=no subtitles,bad subtitles,subs out of sync
-  MOVIE_OTHER_KEYWORDS=buffering,playback error,corrupt file
-  MOVIE_WRONG_KEYWORDS=wrong movie,not the right movie,incorrect movie
-  ```
+# Or custom header authentication
+WEBHOOK_HEADER_NAME="X-Custom-Auth"
+WEBHOOK_HEADER_VALUE="your-auth-token"
+```
 
-- **Comment templates**
-  ```
-  MSG_COACH_TV_AUDIO=[Remediarr] Tip: include one of these keywords to auto-fix TV audio: {keywords}.
-  MSG_COACH_TV_VIDEO=[Remediarr] Tip: include one of these keywords to auto-fix TV video: {keywords}.
-  MSG_COACH_TV_SUBTITLE=[Remediarr] Tip: include one of these keywords to auto-fix TV subtitles: {keywords}.
-  MSG_COACH_TV_OTHER=[Remediarr] Tip: include one of these keywords for TV other: {keywords}.
-  MSG_COACH_MOV_AUDIO=[Remediarr] Tip: include one of these keywords to auto-handle movie audio: {keywords}.
-  MSG_COACH_MOV_VIDEO=[Remediarr] Tip: include one of these keywords to auto-handle movie video: {keywords}.
-  MSG_COACH_MOV_SUBTITLE=[Remediarr] Tip: include one of these keywords to auto-handle movie subtitles: {keywords}.
-  MSG_COACH_MOV_OTHER=[Remediarr] Tip: include one of these keywords to auto-handle movie other: {keywords}.
+## Supported Issue Types
 
-  MSG_TV_EP_REPLACED=[Remediarr] {title} S{season:02d}E{episode:02d} – deleted file and re-download started.
-  MSG_TV_EP_SEARCH_ONLY=[Remediarr] {title} S{season:02d}E{episode:02d} – re-download started.
-  MSG_TV_OTHER_SEARCH_ONLY=[Remediarr] {title} S{season:02d}E{episode:02d} – search triggered (no delete).
+### TV Shows
+- **Audio Issues**: "no audio", "missing audio", "wrong language" → Deletes episode file, triggers re-download
+- **Video Issues**: "no video", "black screen", "pixelation" → Deletes episode file, triggers re-download  
+- **Subtitle Issues**: "no subtitles", "subs out of sync" → Deletes episode file, triggers re-download
+- **Other Issues**: "buffering", "corrupt file" → Deletes episode file, triggers re-download
 
-  MSG_MOV_GENERIC_HANDLED=[Remediarr] {title}: blocklisted last grab, deleted {deleted} file(s), search started.
-  MSG_MOV_WRONG_HANDLED=[Remediarr] Wrong movie: {title}. Blocklisted last grab, deleted {deleted} file(s), search started.
-  MSG_MOV_WRONG_NO_RELEASE=[Remediarr] Wrong movie: {title}. Blocklisted last grab, deleted {deleted} file(s). Not searching (not digitally released).
+### Movies
+- **Audio/Video/Subtitle Issues**: Same behavior as TV shows
+- **Wrong Movie**: "wrong movie", "incorrect movie" → Deletes all movie files, triggers new search
+- **Other Issues**: "buffering", "corrupt file" → Deletes movie files, triggers new search
 
-  MSG_AUTOCLOSE_FAIL=[Remediarr] Action completed but I couldn’t auto-close this issue. Please close it once you verify it’s fixed.
-  ```
+## User Coaching
 
----
+When users don't include recognizable keywords, Remediarr posts helpful suggestions:
+
+**User comment**: "this doesn't work"  
+**Remediarr response**: "Tip for other issues: Include keywords like 'buffering', 'corrupt file', 'playback error' for automatic fixes."
+
+## Notifications
+
+### Gotify
+```bash
+GOTIFY_URL=https://gotify.example.com
+GOTIFY_TOKEN=AbCdEf123456
+GOTIFY_PRIORITY=5
+```
+
+### Apprise (Discord, Slack, Telegram, etc.)
+```bash
+APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
+```
+
+## API Endpoints
+
+- `GET /` - Basic status and version info
+- `GET /health` - Simple health check  
+- `GET /health/detailed` - Health check including external services
+- `POST /webhook/jellyseerr` - Main webhook endpoint
+- `GET /docs` - Interactive API documentation
 
 ## Troubleshooting
 
-- **Got 400 “Missing tvdbId/season/episode”**  
-  Make sure your payload includes `tvdbId`, `seasonNumber`, and `episodeNumber` where possible, or include `SxxExx` in the text.
+### Common Issues
 
-- **Issue not auto-closed**  
-  Some Jellyseerr builds reject auto-close endpoints. Remediarr leaves a comment if it can’t close the issue. You can disable attempts with:  
-  ```
-  JELLYSEERR_CLOSE_ISSUES=false
-  ```
+**"Missing tvdbId/season/episode" error**
+- Ensure your Jellyseerr webhook payload includes all the template variables
+- Check that the issue was reported with season/episode information
 
----
+**Issues not auto-closing**
+- Some Jellyseerr versions don't support the close API endpoint
+- Disable with `JELLYSEERR_CLOSE_ISSUES=false` if needed
+- Remediarr will still comment when actions are taken
+
+**Webhook loops**  
+- Only enable "Issue Reported" in Jellyseerr webhook settings
+- Don't enable "Issue Comment" or other event types
+
+**Files not found in Sonarr/Radarr**
+- Verify the content exists in your *arr apps
+- Check that TVDB/TMDB IDs match between Jellyseerr and your *arr apps
+
+### Debug Mode
+```bash
+LOG_LEVEL=DEBUG
+```
+
+This enables detailed logging of webhook processing, keyword matching, and API calls.
+
+## Development
+
+### Local Development
+```bash
+git clone https://github.com/sbcrumb/remediarr.git
+cd remediarr
+cp .env.example .env
+# Edit .env with your settings
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8189
+```
+
+### Docker Development
+```bash
+docker build -t remediarr:dev .
+docker run --rm -p 8189:8189 --env-file .env remediarr:dev
+```
+
+## Container Images
+
+- **Latest stable**: `ghcr.io/sbcrumb/remediarr:latest`
+- **Version tagged**: `ghcr.io/sbcrumb/remediarr:v1.0.0`  
+- **Development**: `ghcr.io/sbcrumb/remediarr:dev`
 
 ## Contributing
 
-1. Fork the repo  
-2. Create a feature branch  
-3. Commit your changes  
-4. Push  
-5. Open a PR  
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature-name`
+3. Make your changes
+4. Add tests if applicable
+5. Commit: `git commit -m 'Add feature'`
+6. Push: `git push origin feature-name`  
+7. Open a Pull Request
 
-Please keep PRs small and focused.  
-If you add new settings, update `.env.example`.
-
----
+Please update `.env.example` if you add new configuration options.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-```
-MIT License
+## Support
 
-Copyright (c) 2025 SBCrumb
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
----
+- **Issues**: [GitHub Issues](https://github.com/sbcrumb/remediarr/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/sbcrumb/remediarr/discussions)
+- **Documentation**: Check the `.env.example` file for all configuration options
 
 ## Donations
 
-If Remediarr saves you time, consider fueling more tinkering:
+If Remediarr saves you time managing media issues:
 
-- GitHub Sponsors: https://github.com/sponsors/sbcrumb?preview=true  
-- Ko-fi: Coming Soon
-- Buy Me a Coffee: Coming Soon
-- Bitcoin (BTC): `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`  
-
-Thank you! 🚀
-
-
-### Dev / Testing builds
-- Stable: `ghcr.io/sbcrumb/remediarr:latest`
-- Versioned: `ghcr.io/sbcrumb/remediarr:v0.1.7`
-- **Dev/testing**: `ghcr.io/sbcrumb/remediarr:dev` (updated on each push to the `dev` branch)
+- **GitHub Sponsors**: [sponsor sbcrumb](https://github.com/sponsors/sbcrumb)
+- **Bitcoin**: `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`

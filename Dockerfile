@@ -1,23 +1,27 @@
-# syntax=docker/dockerfile:1.7
-
 FROM python:3.11-slim
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
-# Accept a build-time version (fallback to file copy)
-ARG VERSION=0.0.0-dev
-ENV APP_VERSION=${VERSION}
+# System deps (curl for healthcheck/debug)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install deps with BuildKit cache
+# ---- Dependencies
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
-COPY app.py /app/app.py
+# ---- App code
+COPY app ./app
 
-# Also copy the plaintext VERSION file (for local runs / safety)
-COPY VERSION /app/VERSION
+# ---- Conditional VERSION file (only for prod builds)
+COPY VERSION* ./
+# The * makes it optional - won't fail if VERSION doesn't exist
 
-EXPOSE 8189
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8189"]
+# ---- Version injection (for build-time override)
+ARG REMEDIARR_VERSION=""
+ENV REMEDIARR_VERSION=${REMEDIARR_VERSION}
+
+# ---- Runtime
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-c", "import os, uvicorn; uvicorn.run('app.main:app', host=os.getenv('APP_HOST','0.0.0.0'), port=int(os.getenv('APP_PORT','8189')), proxy_headers=True)"]
