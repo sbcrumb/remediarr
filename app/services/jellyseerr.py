@@ -74,6 +74,71 @@ async def jelly_last_human_comment(issue_id: int) -> str:
     ctx = _extract_issue_context(await jelly_fetch_issue(issue_id))
     return ctx["last_human_comment"]
 
+async def jelly_get_last_comment_user(issue_id: int) -> Optional[int]:
+    """Get the user ID of the person who made the last human comment."""
+    try:
+        issue_data = await jelly_fetch_issue(issue_id)
+        comments: List[Dict[str, Any]] = issue_data.get("comments") or []
+        
+        # Find the last human comment (not from Remediarr)
+        for c in reversed(comments):
+            body = (c.get("message") or c.get("text") or "").strip()
+            if body and not is_our_comment(body):
+                user = c.get("user")
+                if user:
+                    return user.get("id")
+                break
+        return None
+    except Exception as e:
+        log.error("Error getting last comment user for issue %s: %s", issue_id, e)
+        return None
+
+async def jelly_get_request_user(tmdb_id: int) -> Optional[int]:
+    """Get the user ID who originally requested the movie."""
+    try:
+        client = _client_lazy()
+        
+        # Get all requests to find the one with matching TMDB ID
+        r = await client.get(f"{BASE}/api/v1/request", headers=_headers)
+        r.raise_for_status()
+        requests = r.json().get("results", [])
+        
+        for req in requests:
+            if req.get("media", {}).get("tmdbId") == tmdb_id:
+                requested_by = req.get("requestedBy")
+                if requested_by:
+                    return requested_by.get("id")
+                break
+        return None
+    except Exception as e:
+        log.error("Error getting request user for TMDB %s: %s", tmdb_id, e)
+        return None
+
+async def jelly_can_user_delete_movie(issue_id: int, tmdb_id: int) -> bool:
+    """Check if the user commenting can delete the movie (must be the original requester)."""
+    try:
+        # Get the user who made the last comment
+        comment_user_id = await jelly_get_last_comment_user(issue_id)
+        if not comment_user_id:
+            log.warning("Could not determine commenting user for issue %s", issue_id)
+            return False
+        
+        # Get the user who originally requested the movie
+        request_user_id = await jelly_get_request_user(tmdb_id)
+        if not request_user_id:
+            log.warning("Could not determine original requester for TMDB %s", tmdb_id)
+            return False
+        
+        # Check if they match
+        can_delete = comment_user_id == request_user_id
+        log.info("Permission check: comment_user=%s, request_user=%s, can_delete=%s", 
+                 comment_user_id, request_user_id, can_delete)
+        
+        return can_delete
+    except Exception as e:
+        log.error("Error checking delete permission for issue %s, TMDB %s: %s", issue_id, tmdb_id, e)
+        return False
+
 async def jelly_comment(issue_id: int, text: str) -> None:
     body = {"message": text}
     url = f"{BASE}/api/v1/issue/{issue_id}/comment"
@@ -123,3 +188,62 @@ async def jelly_close(issue_id: int) -> bool:
 
     log.warning("All close attempts failed for issue %s", issue_id)
     return False
+
+async def jelly_delete_media_item(tmdb_id: int) -> bool:
+    """Delete/remove a media item from Jellyseerr."""
+    if not (BASE and API_KEY):
+        log.warning("Cannot delete media item: missing Jellyseerr config")
+        return False
+        
+    try:
+        client = _client_lazy()
+        
+        # Get the media item using the movie ID endpoint
+        r = await client.get(f"{BASE}/api/v1/movie/{tmdb_id}", headers=_headers, params={
+            "language": "en"
+        })
+        r.raise_for_status()
+        search_results = r.json().get("results", [])
+        log.info("Jellyseerr search for TMDB %s returned %d results", tmdb_id, len(search_results))
+        
+        # Find the matching media item
+        media_id = None
+        for item in search_results:
+            if item.get("id") == tmdb_id and item.get("mediaType") == "movie":
+                # Get the media info to find the internal media ID
+                media_info = item.get("mediaInfo")
+                if media_info:
+                    media_id = media_info.get("id")
+                    break
+        
+        if not media_id:
+            # Try alternative approach - get all media and find by TMDB ID
+            try:
+                r2 = await client.get(f"{BASE}/api/v1/media", headers=_headers)
+                if r2.status_code == 200:
+                    all_media = r2.json().get("results", [])
+                    for media in all_media:
+                        if media.get("tmdbId") == tmdb_id:
+                            media_id = media.get("id")
+                            break
+            except Exception as e:
+                log.info("Alternative media search failed: %s", e)
+        
+        if not media_id:
+            log.info("No Jellyseerr media found for TMDB ID %s", tmdb_id)
+            return False
+            
+        log.info("Found Jellyseerr media ID %s for TMDB %s", media_id, tmdb_id)
+        
+        # Delete the media item (this removes it from Jellyseerr)
+        delete_r = await client.delete(f"{BASE}/api/v1/media/{media_id}", headers=_headers)
+        if delete_r.status_code in (200, 202, 204):
+            log.info("Successfully deleted Jellyseerr media %s for TMDB %s", media_id, tmdb_id)
+            return True
+        else:
+            log.warning("Failed to delete Jellyseerr media %s: status %s", media_id, delete_r.status_code)
+            return False
+            
+    except Exception as e:
+        log.error("Error deleting media item for TMDB %s: %s", tmdb_id, e)
+        return False
