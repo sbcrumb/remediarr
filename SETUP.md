@@ -136,6 +136,7 @@ You should see all services as "healthy".
    - "no audio in this episode"
    - "video glitch in this movie"  
    - "missing subtitles"
+   - "watched" (for movies - will completely remove from radarr & jellyseerr)
 
 3. Watch the Remediarr logs:
    ```bash
@@ -172,6 +173,7 @@ Add your own trigger words:
 ```bash
 TV_AUDIO_KEYWORDS=no audio,no sound,missing audio,silent,muted
 MOVIE_WRONG_KEYWORDS=wrong movie,incorrect film,not the right one
+MOVIE_WATCHED_KEYWORDS=watched,delete,remove,done,finished
 ```
 
 ## Troubleshooting
@@ -240,6 +242,7 @@ Once working properly:
 ### Movies  
 - **Audio/Video/Subs**: Same as TV shows
 - **Wrong Movie**: "wrong movie", "incorrect movie", "not the right movie"
+- **Movie Watched**: "watched", "delete", "remove", "done", "finished"
 - **Other**: "buffering", "corrupt file", "playback error"
 
 All keywords are case-insensitive and matched as substrings, so "No Audio!" will match "no audio".
