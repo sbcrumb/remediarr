@@ -16,3 +16,4 @@ MOV_VIDEO = lambda: _csv_env("MOVIE_VIDEO_KEYWORDS", "no video,video missing,bad
 MOV_SUBTITLE = lambda: _csv_env("MOVIE_SUBTITLE_KEYWORDS", "missing subs,no subtitles,bad subtitles,wrong subs,subs out of sync")
 MOV_OTHER = lambda: _csv_env("MOVIE_OTHER_KEYWORDS", "buffering,playback error,corrupt file")
 MOV_WRONG = lambda: _csv_env("MOVIE_WRONG_KEYWORDS", "not the right movie,wrong movie,incorrect movie")
+MOV_WATCHED = lambda: _csv_env("MOVIE_WATCHED_KEYWORDS", "watched,delete,remove,done,finished")
