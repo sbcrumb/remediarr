@@ -142,6 +142,7 @@ MOVIE_VIDEO_KEYWORDS="no video,video missing,bad video,black screen"
 MOVIE_SUBTITLE_KEYWORDS="missing subs,no subtitles,bad subtitles"
 MOVIE_OTHER_KEYWORDS="buffering,playback error,corrupt file"
 MOVIE_WRONG_KEYWORDS="wrong movie,incorrect movie,not the right movie"
+MOVIE_WATCHED_KEYWORDS="watched,delete,remove,done,finished"
 ```
 
 ### Security Options
@@ -166,6 +167,7 @@ WEBHOOK_HEADER_VALUE="your-auth-token"
 ### Movies
 - **Audio/Video/Subtitle Issues**: Same behavior as TV shows
 - **Wrong Movie**: "wrong movie", "incorrect movie" → Deletes all movie files, triggers new search
+- **Movie Watched**: "watched", "delete", "remove" → Completely removes movie from Radarr and Jellyseerr (only by original requester)
 - **Other Issues**: "buffering", "corrupt file" → Deletes movie files, triggers new search
 
 ## User Coaching
