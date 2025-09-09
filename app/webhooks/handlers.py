@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional, Tuple, List
 from datetime import datetime
 
 from app.services.jellyseerr import (
-    jelly_fetch_issue, jelly_last_human_comment, jelly_comment, jelly_close, is_our_comment
+    jelly_fetch_issue, jelly_last_human_comment, jelly_comment, jelly_close, is_our_comment, 
+    jelly_delete_media_item, jelly_can_user_delete_movie
 )
 from app.services import radarr as R
 from app.services import sonarr as S
@@ -36,14 +37,18 @@ MOV_VIDEO = set(_csv("MOVIE_VIDEO_KEYWORDS") or ["no video", "video missing", "b
 MOV_SUBS = set(_csv("MOVIE_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
 MOV_OTHER = set(_csv("MOVIE_OTHER_KEYWORDS") or ["buffering", "playback error", "corrupt file"])
 MOV_WRONG = set(_csv("MOVIE_WRONG_KEYWORDS") or ["not the right movie", "wrong movie", "incorrect movie"])
+MOV_WATCHED = set(_csv("MOVIE_WATCHED_KEYWORDS") or ["watched", "delete", "remove", "done", "finished"])
 
 def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
     
-    # Check for wrong movie first (movie-specific)
+    # Check for movie-specific keywords first
     if media_type == "movie":
+        for keyword in MOV_WATCHED:
+            if keyword in t:
+                return "watched"
         for keyword in MOV_WRONG:
             if keyword in t:
                 return "wrong"
@@ -276,9 +281,66 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
 
 async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> None:
     movie_id = movie["id"]
+    tmdb_id = movie.get("tmdbId")
     title = movie.get("title") or f"Movie {movie_id}"
     
-    # Delete files if needed
+    if bucket == "watched":
+        # For "watched" movies, delete from both Radarr and Jellyseerr
+        log.info("User marked movie as watched - checking permissions for: %s", title)
+        
+        # Check if the commenting user is the original requester (if enabled)
+        if tmdb_id:
+            can_delete = await jelly_can_user_delete_movie(issue_id, tmdb_id)
+            if not can_delete:
+                log.warning("User not authorized to delete movie %s - not the original requester", title)
+                if COMMENT_ON_ACTION:
+                    msg = f"{title}: Only the user who originally requested this movie can mark it as watched."
+                    await jelly_comment(issue_id, f"{PREFIX} {msg}")
+                return
+        elif not tmdb_id:
+            log.warning("Cannot check permissions for movie %s - missing TMDB ID", title)
+            if COMMENT_ON_ACTION:
+                msg = f"{title}: Cannot verify permissions - missing movie information."
+                await jelly_comment(issue_id, f"{PREFIX} {msg}")
+            return
+        
+        log.info("User authorized to delete movie %s - proceeding with deletion", title)
+        
+        # Delete from Radarr (with files)
+        radarr_deleted = await R.delete_movie(movie_id, delete_files=True)
+        
+        # Delete from Jellyseerr if we have TMDB ID
+        jellyseerr_deleted = False
+        if tmdb_id:
+            jellyseerr_deleted = await jelly_delete_media_item(tmdb_id)
+        
+        # Only comment if Jellyseerr deletion failed (since successful deletion removes the issue)
+        if not jellyseerr_deleted and COMMENT_ON_ACTION:
+            if radarr_deleted:
+                msg = f"{title}: marked as watched - removed from Radarr but couldn't remove from Jellyseerr. Please check manually."
+            else:
+                msg = f"{title}: marked as watched but couldn't remove from systems. Please check manually."
+            await jelly_comment(issue_id, f"{PREFIX} {msg}")
+        
+        # Only try to close issue if Jellyseerr deletion failed (otherwise issue is already gone)
+        if not jellyseerr_deleted and CLOSE_ISSUES:
+            closed = await jelly_close(issue_id)
+            log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+            
+        # Log the final result
+        if jellyseerr_deleted and radarr_deleted:
+            log.info("Successfully marked %s as watched - removed from both systems", title)
+        elif jellyseerr_deleted:
+            log.info("Marked %s as watched - removed from Jellyseerr, Radarr deletion failed", title)
+        elif radarr_deleted:
+            log.info("Marked %s as watched - removed from Radarr, Jellyseerr deletion failed", title)
+        else:
+            log.warning("Failed to mark %s as watched - could not remove from either system", title)
+            
+        await notify(f"Remediarr - Movie Watched", f"{title}: marked as watched")
+        return
+    
+    # Existing logic for other buckets
     removed = 0
     if bucket in ("audio", "video", "subtitle", "wrong"):
         log.info("Deleting movie files for movie %s", movie_id)
@@ -401,8 +463,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
                 elif issue_type == "other":
                     keywords = list(MOV_OTHER)[:5]
                 else:
-                    # If issue type unknown, show a mix but prioritize common ones
-                    keywords = list(MOV_VIDEO)[:2] + list(MOV_AUDIO)[:2] + list(MOV_WRONG)[:2]
+                    keywords = list(MOV_WATCHED)[:2] + list(MOV_VIDEO)[:2] + list(MOV_AUDIO)[:2]
                     
             elif media_type in ("tv", "series"):
                 if issue_type == "video":

@@ -52,6 +52,21 @@ async def trigger_search_movie(movie_id: int) -> None:
     r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
     r.raise_for_status()
 
+async def delete_movie(movie_id: int, delete_files: bool = True) -> bool:
+    """Delete a movie from Radarr entirely."""
+    try:
+        params = {"deleteFiles": "true" if delete_files else "false", "addImportExclusion": "false"}
+        r = await _client_lazy().delete(f"{API}/movie/{movie_id}", headers=HEADERS, params=params)
+        if r.status_code in (200, 202, 204):
+            log.info("Movie %s deleted from Radarr (deleteFiles=%s)", movie_id, delete_files)
+            return True
+        else:
+            log.warning("Failed to delete movie %s from Radarr: status %s", movie_id, r.status_code)
+            return False
+    except Exception as e:
+        log.error("Error deleting movie %s from Radarr: %s", movie_id, e)
+        return False
+
 def _parse_history_listish(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
