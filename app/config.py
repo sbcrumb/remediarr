@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     # ===== Cooldown =====
     REMEDIARR_ISSUE_COOLDOWN_SEC: int = 90
 
+    # ===== Startup Health Check Settings =====
+    STARTUP_HEALTH_CHECK_RETRIES: int = 3
+    STARTUP_HEALTH_CHECK_DELAY: int = 10  # seconds between retries
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
