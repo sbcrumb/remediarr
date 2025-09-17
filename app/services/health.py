@@ -8,6 +8,15 @@ from app.config import cfg
 from app.logging import log
 
 
+import asyncio
+from typing import Tuple
+
+import httpx
+
+from app.config import cfg
+from app.logging import log
+
+
 async def _ping_json(url: str, headers: dict) -> Tuple[bool, str]:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
