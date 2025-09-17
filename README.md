@@ -270,9 +270,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Discussions**: [GitHub Discussions](https://github.com/sbcrumb/remediarr/discussions)
 - **Documentation**: Check the `.env.example` file for all configuration options
 
-## Donations
-
+## 💖 Donations
 If Remediarr saves you time managing media issues:
 
-- **GitHub Sponsors**: [sponsor sbcrumb](https://github.com/sponsors/sbcrumb)
-- **Bitcoin**: `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`
+- [GitHub Sponsors](https://github.com/sponsors/sbcrumb)
+- Bitcoin: `bc1qjc200yg9mc08uskmeka8zrjddp8lw2j6d8q0kn`
