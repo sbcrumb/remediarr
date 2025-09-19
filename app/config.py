@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     JELLYSEERR_URL: str
     JELLYSEERR_API_KEY: str
 
+    BAZARR_URL: Optional[str] = None
+    BAZARR_API_KEY: Optional[str] = None
+    BAZARR_HTTP_TIMEOUT: int = 60
+    BAZARR_SUBTITLE_LANGUAGES: str = "en"
+    BAZARR_FORCE_REDOWNLOAD: bool = False
+
     # ===== Behavior toggles =====
     JELLYSEERR_CLOSE_ISSUES: bool = True
     JELLYSEERR_COMMENT_ON_ACTION: bool = True

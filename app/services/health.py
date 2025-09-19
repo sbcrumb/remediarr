@@ -78,3 +78,33 @@ async def radarr_ok() -> Tuple[bool, str]:
         return await _ping_json(url, headers)
     
     return await _health_check_with_retry("Radarr", _check)
+
+
+async def bazarr_ok() -> Tuple[bool, str]:
+    """Check Bazarr health. Returns (True, detail) if configured and healthy, or (True, 'disabled') if not configured."""
+    if not cfg.BAZARR_URL or not cfg.BAZARR_API_KEY:
+        return True, "disabled"
+    
+    async def _check():
+        # Try system status endpoint, fallback to API root if needed
+        url = cfg.BAZARR_URL.rstrip("/") + "/api/system/status"
+        headers = {"X-API-KEY": cfg.BAZARR_API_KEY}
+        
+        # First try system/status
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(url, headers=headers)
+                if r.status_code == 200:
+                    return True, f"{r.status_code}"
+                elif r.status_code == 404:
+                    # Try alternative endpoint structure
+                    alt_url = cfg.BAZARR_URL.rstrip("/") + "/api"
+                    r2 = await c.get(alt_url, headers=headers)
+                    ok = r2.status_code in (200, 404)  # 404 is acceptable for API root
+                    return ok, f"{r2.status_code}"
+                else:
+                    return False, f"{r.status_code}"
+        except Exception as e:
+            return False, str(e)
+    
+    return await _health_check_with_retry("Bazarr", _check)
