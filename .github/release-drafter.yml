@@ -14,5 +14,5 @@ template: |
   $CHANGES
 
   ## Container Images
-  - `ghcr.io/${{ repo_owner }}/${{ repo_name }}:latest`
-  - `ghcr.io/${{ repo_owner }}/${{ repo_name }}:$NEXT_PATCH_VERSION`
+  - `ghcr.io/$OWNER/$REPOSITORY:latest`
+  - `ghcr.io/$OWNER/$REPOSITORY:$NEXT_PATCH_VERSION`
