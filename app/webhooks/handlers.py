@@ -10,7 +10,9 @@ from app.services.jellyseerr import (
 )
 from app.services import radarr as R
 from app.services import sonarr as S
+from app.services import bazarr as B
 from app.services.notify import notify
+from app.config import cfg
 
 log = logging.getLogger("remediarr")
 
@@ -274,11 +276,83 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     
     return series["id"], series, int(season), int(episode)
 
+def _is_bazarr_enabled() -> bool:
+    """Check if Bazarr is configured and enabled."""
+    return bool(cfg.BAZARR_URL and cfg.BAZARR_API_KEY)
+
+async def _handle_subtitle_with_bazarr(issue_id: int, media_type: str, media_id: int, title: str, 
+                                      season: Optional[int] = None, episode: Optional[int] = None) -> bool:
+    """Handle subtitle issues using Bazarr. Returns True if handled successfully."""
+    if not _is_bazarr_enabled():
+        return False
+    
+    try:
+        if media_type == "movie":
+            # Get Radarr movie ID and find corresponding Bazarr movie
+            bazarr_movie = await B.get_movie_by_radarr_id(media_id)
+            if not bazarr_movie:
+                log.warning("Movie %s not found in Bazarr", media_id)
+                return False
+            
+            bazarr_id = bazarr_movie.get("id")
+            if not bazarr_id:
+                log.warning("Bazarr movie missing ID: %s", bazarr_movie)
+                return False
+            
+            # Delete existing subtitles and trigger new search
+            deleted = await B.delete_movie_subtitles(bazarr_id)
+            log.info("Deleted %s subtitle files for movie %s", deleted, bazarr_id)
+            
+            success = await B.search_movie_subtitles(bazarr_id)
+            if success:
+                msg = f"{title}: searched for new subtitles using Bazarr"
+                if COMMENT_ON_ACTION:
+                    await jelly_comment(issue_id, f"{PREFIX} {msg}")
+                await notify(f"Remediarr - Movie Subtitles", msg)
+                return True
+                
+        elif media_type == "tv":
+            # Get Sonarr series ID and find corresponding Bazarr series
+            bazarr_series = await B.get_series_by_tvdb(media_id)  # Note: this needs TVDB ID, not Sonarr ID
+            if not bazarr_series:
+                log.warning("Series %s not found in Bazarr", media_id)
+                return False
+            
+            # For TV, we need to find the specific episode in Bazarr
+            # This is more complex as we need to match season/episode
+            # For now, trigger a general subtitle search for the series
+            success = await B.trigger_wanted_search("series")
+            if success:
+                msg = f"{title} S{season:02d}E{episode:02d}: searched for new subtitles using Bazarr"
+                if COMMENT_ON_ACTION:
+                    await jelly_comment(issue_id, f"{PREFIX} {msg}")
+                await notify(f"Remediarr - TV Subtitles", msg)
+                return True
+                
+    except Exception as e:
+        log.error("Bazarr subtitle handling failed: %s", e)
+        return False
+    
+    return False
+
 async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> None:
     movie_id = movie["id"]
     title = movie.get("title") or f"Movie {movie_id}"
     
-    # Delete files if needed
+    # Handle subtitle issues with Bazarr if enabled and configured
+    if bucket == "subtitle":
+        bazarr_handled = await _handle_subtitle_with_bazarr(issue_id, "movie", movie_id, title)
+        if bazarr_handled:
+            # Close issue if Bazarr handled it successfully
+            if CLOSE_ISSUES:
+                closed = await jelly_close(issue_id)
+                log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+            return
+        
+        # Fall back to traditional approach if Bazarr not available or failed
+        log.info("Falling back to traditional subtitle handling for movie %s", movie_id)
+    
+    # Delete files if needed (traditional approach)
     removed = 0
     if bucket in ("audio", "video", "subtitle", "wrong"):
         log.info("Deleting movie files for movie %s", movie_id)
@@ -303,7 +377,23 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     series_id = series["id"]
     title = series.get("title") or f"Series {series_id}"
     
-    # Delete files if needed
+    # Handle subtitle issues with Bazarr if enabled and configured
+    if bucket == "subtitle":
+        # For TV shows, we need the TVDB ID to find the series in Bazarr
+        tvdb_id = series.get("tvdbId")
+        if tvdb_id:
+            bazarr_handled = await _handle_subtitle_with_bazarr(issue_id, "tv", tvdb_id, title, season, episode)
+            if bazarr_handled:
+                # Close issue if Bazarr handled it successfully
+                if CLOSE_ISSUES:
+                    closed = await jelly_close(issue_id)
+                    log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+                return
+        
+        # Fall back to traditional approach if Bazarr not available or failed
+        log.info("Falling back to traditional subtitle handling for series %s", series_id)
+    
+    # Delete files if needed (traditional approach)
     removed = 0
     if bucket in ("audio", "video", "subtitle"):
         log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)

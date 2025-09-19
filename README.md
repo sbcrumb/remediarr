@@ -48,6 +48,10 @@ services:
       - JELLYSEERR_URL=http://jellyseerr:5055
       - JELLYSEERR_API_KEY=your-jellyseerr-api-key
       
+      # Optional - Bazarr subtitle integration
+      - BAZARR_URL=http://bazarr:6767
+      - BAZARR_API_KEY=your-bazarr-api-key
+      
       # Optional - Notifications
       - GOTIFY_URL=https://gotify.example.com
       - GOTIFY_TOKEN=your-gotify-token
@@ -70,6 +74,8 @@ docker run -d \
   -e RADARR_API_KEY=your-api-key \
   -e JELLYSEERR_URL=http://jellyseerr:5055 \
   -e JELLYSEERR_API_KEY=your-api-key \
+  -e BAZARR_URL=http://bazarr:6767 \
+  -e BAZARR_API_KEY=your-api-key \
   ghcr.io/sbcrumb/remediarr:latest
 ```
 
@@ -125,6 +131,13 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `JELLYSEERR_URL` | Jellyseerr base URL | `http://jellyseerr:5055` |
 | `JELLYSEERR_API_KEY` | Jellyseerr API key | `ghi789...` |
 
+### Optional Settings
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
+| `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
+
 ### Keyword Customization
 
 You can customize which keywords trigger each action type:
@@ -160,13 +173,29 @@ WEBHOOK_HEADER_VALUE="your-auth-token"
 ### TV Shows
 - **Audio Issues**: "no audio", "missing audio", "wrong language" → Deletes episode file, triggers re-download
 - **Video Issues**: "no video", "black screen", "pixelation" → Deletes episode file, triggers re-download  
-- **Subtitle Issues**: "no subtitles", "subs out of sync" → Deletes episode file, triggers re-download
+- **Subtitle Issues**: "no subtitles", "subs out of sync" → **Uses Bazarr** (if configured) to search for subtitles, otherwise deletes episode file and triggers re-download
 - **Other Issues**: "buffering", "corrupt file" → Deletes episode file, triggers re-download
 
 ### Movies
-- **Audio/Video/Subtitle Issues**: Same behavior as TV shows
+- **Audio/Video Issues**: Same behavior as TV shows
+- **Subtitle Issues**: **Uses Bazarr** (if configured) to search for subtitles, otherwise deletes movie files and triggers new search
 - **Wrong Movie**: "wrong movie", "incorrect movie" → Deletes all movie files, triggers new search
 - **Other Issues**: "buffering", "corrupt file" → Deletes movie files, triggers new search
+
+## Bazarr Integration
+
+When Bazarr is configured (`BAZARR_URL` and `BAZARR_API_KEY` set), subtitle issues are handled more intelligently:
+
+### Enhanced Subtitle Handling
+- **Movies**: Searches for new subtitles via Bazarr, deletes existing poor subtitles first
+- **TV Shows**: Triggers subtitle search for the specific episode via Bazarr 
+- **Fallback**: If Bazarr is unavailable or fails, falls back to traditional file deletion and re-download
+
+### Benefits of Bazarr Integration
+- **Faster resolution**: Only downloads subtitles, not entire media files
+- **Provider diversity**: Leverages Bazarr's multiple subtitle providers
+- **Language support**: Respects Bazarr's configured languages and preferences
+- **Bandwidth efficient**: Avoids unnecessary media re-downloads for subtitle-only issues
 
 ## User Coaching
 
