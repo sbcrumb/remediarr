@@ -54,4 +54,5 @@ async def on_startup():
         f"Bazarr health: {'OK' if b_ok else 'FAIL'} ({b_detail})",
     ])
     log.info(msg)
-    await notify(title=f"{cfg.APP_NAME} started", message=msg)
+    if not cfg.DISABLE_STARTUP_NOTIFICATION:
+        await notify(title=f"{cfg.APP_NAME} started", message=msg)
