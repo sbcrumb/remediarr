@@ -206,6 +206,12 @@ When users don't include recognizable keywords, Remediarr posts helpful suggesti
 
 ## Notifications
 
+By default, a healthcheck notification is sent on every application startup. This behavior can be disabled by adding the following:
+
+```bash
+DISABLE_STARTUP_NOTIFICATION=true
+```
+
 ### Gotify
 ```bash
 GOTIFY_URL=https://gotify.example.com
