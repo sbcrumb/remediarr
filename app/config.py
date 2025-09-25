@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     GOTIFY_URL: Optional[str] = None
     GOTIFY_TOKEN: Optional[str] = None
     GOTIFY_PRIORITY: int = 5
-    DISABLE_STARTUP_NOTIFICATION: str = False
+    DISABLE_STARTUP_NOTIFICATION: bool = False
 
     # ===== Customizable messages =====
     MSG_MOVIE_SUCCESS: Optional[str] = None
