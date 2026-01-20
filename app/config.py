@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     TV_VIDEO_KEYWORDS: str = "no video,video glitch,black screen,stutter,pixelation"
     TV_SUBTITLE_KEYWORDS: str = "missing subs,no subtitles,bad subtitles,wrong subs,subs out of sync"
     TV_OTHER_KEYWORDS: str = "buffering,playback error,corrupt file"
+    TV_WRONG_KEYWORDS: str = "not the right show,wrong show,incorrect show,wrong episode,incorrect episode,not the right episode"
 
     MOVIE_AUDIO_KEYWORDS: str = "no audio,no sound,audio issue,wrong language,not in english"
     MOVIE_VIDEO_KEYWORDS: str = "no video,video missing,bad video,broken video,black screen"
@@ -103,6 +104,7 @@ class Settings(BaseSettings):
     MSG_MOVIE_SUCCESS: Optional[str] = None
     MSG_TV_SUCCESS: Optional[str] = None
     MSG_AUTOCLOSE_FAIL: Optional[str] = None
+    MSG_COACH: Optional[str] = None
 
     # ===== Cooldown =====
     REMEDIARR_ISSUE_COOLDOWN_SEC: int = 90
