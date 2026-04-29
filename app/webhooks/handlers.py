@@ -172,6 +172,32 @@ def _bump_cooldown(issue_id: int) -> None:
 
 _ALL_EPISODES_SENTINELS = {"all episodes", "all", "0", ""}
 
+def _parse_episode_list_from_text(text: str, known_season: Optional[int] = None) -> List[int]:
+    """Extract specific episode numbers from free text.
+    Handles: 'episodes 3,4,5,6,22', 'ep 3-6 and 22', 'eps 3, 4, 5'.
+    Returns sorted deduplicated list, or [] if nothing specific found.
+    """
+    if not text:
+        return []
+    episodes: set = set()
+    # Match after episode/ep/eps keyword
+    for m in re.finditer(r'\bep(?:isodes?|s)?\s+([\d,\s\-\–]+(?:and\s+[\d,\s\-\–]+)*)', text, re.IGNORECASE):
+        block = m.group(1)
+        # Expand ranges like 3-6
+        for rng in re.finditer(r'(\d+)\s*[-\–]\s*(\d+)', block):
+            start, end = int(rng.group(1)), int(rng.group(2))
+            if start < end and (end - start) <= 50:
+                episodes.update(range(start, end + 1))
+        # Individual numbers
+        for n in re.finditer(r'\d+', block):
+            val = int(n.group())
+            if 1 <= val <= 999:
+                episodes.add(val)
+    if known_season is not None:
+        episodes.discard(known_season)
+    return sorted(episodes)
+
+
 def _is_all_episodes(value: Any) -> bool:
     if value is None:
         return True
@@ -398,6 +424,40 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
     
     await notify(f"Remediarr - Movie", f"{title}: fixed")
 
+async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    all_episode_ids: List[int] = []
+    handled_eps: List[int] = []
+
+    for ep_num in episodes:
+        ep_ids = await S.episode_ids_for(series_id, season, ep_num)
+        if not ep_ids:
+            log.info("No episode file in Sonarr for S%02dE%02d, skipping", season, ep_num)
+            continue
+        if bucket in ("audio", "video", "subtitle"):
+            removed = await S.delete_episodefiles(series_id, ep_ids)
+            log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+        all_episode_ids.extend(ep_ids)
+        handled_eps.append(ep_num)
+
+    if not handled_eps:
+        log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
+        return
+
+    await S.trigger_episode_search(all_episode_ids)
+
+    ep_list = ", ".join(f"E{e:02d}" for e in handled_eps)
+    msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+    await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
+
+
 async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str) -> None:
     series_id = series["id"]
     title = series.get("title") or f"Series {series_id}"
@@ -615,6 +675,20 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "detail": f"ignored: {str(e)}"}
 
         if episode == 0:
+            # Check issue description + comments for a specific episode list before nuking the whole season
+            text_to_scan = " ".join([
+                str(enriched_payload.get("message") or ""),
+                str((enriched_payload.get("issue") or {}).get("message") or ""),
+                str((enriched_payload.get("comment") or {}).get("comment_message") or ""),
+            ])
+            specific_eps = _parse_episode_list_from_text(text_to_scan, known_season=season)
+
+            if specific_eps:
+                log.info("Found specific episodes in text for S%02d: %s — handling individually", season, specific_eps)
+                await _handle_tv_specific_episodes(issue_id, series, season, specific_eps, bucket)
+                _bump_cooldown(issue_id)
+                return {"ok": True, "detail": f"tv specific episodes handled: {bucket}"}
+
             log.info("Processing TV series %s (%s) S%02d (all episodes) with bucket: %s",
                      series_id, series.get("title"), season, bucket)
             await _handle_tv_season(issue_id, series, season, bucket)
