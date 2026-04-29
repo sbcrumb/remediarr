@@ -62,6 +62,29 @@ async def trigger_episode_search(episode_ids: List[int]) -> None:
     r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
     r.raise_for_status()
 
+async def get_all_episode_ids_for_season(series_id: int, season: int) -> List[int]:
+    eps = await list_episodes(series_id)
+    return [e["id"] for e in eps if e.get("seasonNumber") == season and isinstance(e.get("id"), int)]
+
+async def delete_all_episodefiles_for_season(series_id: int, season: int) -> int:
+    eps = await list_episodes(series_id)
+    file_ids = [
+        e["episodeFileId"] for e in eps
+        if e.get("seasonNumber") == season and e.get("episodeFileId")
+    ]
+    removed = 0
+    for fid in file_ids:
+        dr = await _client_lazy().delete(f"{API}/episodefile/{fid}", headers=HEADERS)
+        if dr.status_code in (200, 202, 204):
+            removed += 1
+    log.info("Series %s season %s delete_all_episodefiles: removed=%s", series_id, season, removed)
+    return removed
+
+async def trigger_season_search(series_id: int, season: int) -> None:
+    body = {"name": "SeasonSearch", "seriesId": series_id, "seasonNumber": season}
+    r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
+    r.raise_for_status()
+
 def _parse_history_listish(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
