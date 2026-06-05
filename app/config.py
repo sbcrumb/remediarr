@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # ===== Behavior toggles =====
     JELLYSEERR_CLOSE_ISSUES: bool = True
     JELLYSEERR_COMMENT_ON_ACTION: bool = True
+    # When true, the Seerr issue TYPE (audio/video/subtitle/other) drives the
+    # remediation action and the comment is ignored. OFF by default.
+    ISSUE_TYPE_AS_BUCKET: bool = False
 
     # ===== Keyword buckets (comma-separated) =====
     TV_AUDIO_KEYWORDS: str = "no audio,no sound,missing audio,audio issue,wrong language,not in english"

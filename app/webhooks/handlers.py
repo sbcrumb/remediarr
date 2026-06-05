@@ -66,7 +66,32 @@ def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     for keyword in (MOV_OTHER | TV_OTHER):
         if keyword in t:
             return "other"
-    
+
+    return None
+
+# Seerr issue TYPE -> bucket, for ISSUE_TYPE_AS_BUCKET mode (no comment needed).
+# Ints match the upstream Overseerr/Jellyseerr IssueType enum
+# (server/constants/issue.ts: VIDEO=1, AUDIO=2, SUBTITLES=3, OTHER=4). The webhook
+# body's string `issue_type` is preferred; this int `issueType` is the fallback.
+_ISSUE_TYPE_INT_TO_BUCKET = {1: "video", 2: "audio", 3: "subtitle", 4: "other"}
+_VALID_TYPE_BUCKETS = {"audio", "video", "subtitle", "other"}
+
+def _bucket_from_issue_type(issue: Dict[str, Any]) -> Optional[str]:
+    """Derive the bucket straight from the Seerr issue TYPE (comment ignored).
+
+    Prefers the webhook-body string ``issue_type`` ("audio"/"video"/...);
+    falls back to the API integer ``issueType`` (1=video, 2=audio, 3=subtitle,
+    4=other). Returns None if neither yields a valid bucket. "wrong" is not
+    reachable here (Seerr has no "wrong" issue type) — that stays keyword-only.
+    """
+    if not issue:
+        return None
+    raw = str(issue.get("issue_type") or "").strip().lower()
+    if raw in _VALID_TYPE_BUCKETS:
+        return raw
+    iv = _to_int_or_none(issue.get("issueType"))
+    if iv in _ISSUE_TYPE_INT_TO_BUCKET:
+        return _ISSUE_TYPE_INT_TO_BUCKET[iv]
     return None
 
 def _to_int_or_none(val) -> Optional[int]:
@@ -468,12 +493,22 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Current comment is ours; skipping.")
         return {"ok": True, "detail": "ignored: processing our own comment"}
 
-    # Bucket
-    bucket = _bucket_for(last, media_type)
-    log.info("Keyword scan: %r -> bucket=%s", last, bucket)
+    # Bucket: ISSUE_TYPE_AS_BUCKET => the Seerr issue TYPE drives the action and
+    # the comment is ignored; otherwise use the comment keyword scan (default).
+    if cfg.ISSUE_TYPE_AS_BUCKET:
+        bucket = _bucket_from_issue_type(enriched_payload.get("issue") or {})
+        log.info("Issue-type mode: issue_type -> bucket=%s", bucket)
+    else:
+        bucket = _bucket_for(last, media_type)
+        log.info("Keyword scan: %r -> bucket=%s", last, bucket)
 
     # No bucket → coach the user if coaching is enabled
     if not bucket:
+        # In issue-type mode the comment/keywords are irrelevant; don't post the
+        # keyword-coaching tip (it would be misleading).
+        if cfg.ISSUE_TYPE_AS_BUCKET:
+            log.info("Issue-type mode: no usable issue type; no action")
+            return {"ok": True, "detail": "ignored: no usable issue type"}
         log.info("No actionable keywords found")
         
         # Coaching: suggest keywords when none match, based on issue type

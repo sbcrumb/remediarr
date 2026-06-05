@@ -11,6 +11,7 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 - **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
 - **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
+- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
 - **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
 - **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
 - **📱 Notifications**: Optional Gotify and Apprise integration
@@ -26,6 +27,8 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 5. **Deletes bad file** and triggers new download in Sonarr
 6. **Comments on issue**: "S02E05: replaced file; new download grabbed"
 7. **Closes the issue** automatically
+
+> **Type-driven mode (opt-in):** set `ISSUE_TYPE_AS_BUCKET=true` and step 3 uses the issue **Type** (Audio/Video/Subtitle/Other) instead of comment keywords — the comment is ignored. Audio/Video/Subtitle delete + re-search; Other searches only.
 
 ## Quick Start
 
@@ -137,6 +140,7 @@ Remediarr is configured entirely through environment variables. See the [complet
 |----------|-------------|---------|
 | `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
+| `ISSUE_TYPE_AS_BUCKET` | When `true`, the issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — a user can just pick a type with no comment. Audio/Video/Subtitle delete + re-search; Other searches only. The `*_KEYWORDS` lists are unused while on. Default `false`. | `false` |
 
 ### Keyword Customization
 
