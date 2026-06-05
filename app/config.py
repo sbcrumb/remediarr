@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     # When true, the Seerr issue TYPE (audio/video/subtitle/other) drives the
     # remediation action and the comment is ignored. OFF by default.
     ISSUE_TYPE_AS_BUCKET: bool = False
+    # When true, a TV remediation does NOT close the issue at search time; it
+    # waits for Sonarr's "On Import" webhook (POST /webhook/sonarr) confirming the
+    # replacement actually landed on disk before commenting success + closing.
+    # OFF by default — the existing close-at-search-time behavior is unchanged.
+    # Applies only to Sonarr file replacements (audio/video/subtitle); "other"
+    # (search-only) and Bazarr-handled subtitle fixes still close at action time,
+    # since neither produces a Sonarr import to wait for.
+    CONFIRM_REPLACEMENT_IMPORT: bool = False
 
     # ===== Keyword buckets (comma-separated) =====
     TV_AUDIO_KEYWORDS: str = "no audio,no sound,missing audio,audio issue,wrong language,not in english"
@@ -108,6 +116,10 @@ class Settings(BaseSettings):
     MSG_TV_SUCCESS: Optional[str] = None
     MSG_AUTOCLOSE_FAIL: Optional[str] = None
     MSG_COACH: Optional[str] = None
+    # CONFIRM_REPLACEMENT_IMPORT messages: interim (posted at search time, no close)
+    # and the confirmation (posted when Sonarr reports the import, then close).
+    MSG_TV_SEARCHING: Optional[str] = None
+    MSG_TV_IMPORTED: Optional[str] = None
 
     # ===== Cooldown =====
     REMEDIARR_ISSUE_COOLDOWN_SEC: int = 90

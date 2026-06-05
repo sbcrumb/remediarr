@@ -12,6 +12,7 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 - **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
 - **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
+- **✅ Confirm-on-Import** *(opt-in)*: Hold the issue open until Sonarr confirms the replacement imported — it closes only when the file is actually on disk (`CONFIRM_REPLACEMENT_IMPORT`)
 - **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
 - **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
 - **📱 Notifications**: Optional Gotify and Apprise integration
@@ -29,6 +30,8 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 7. **Closes the issue** automatically
 
 > **Type-driven mode (opt-in):** set `ISSUE_TYPE_AS_BUCKET=true` and step 3 uses the issue **Type** (Audio/Video/Subtitle/Other) instead of comment keywords — the comment is ignored. Audio/Video/Subtitle delete + re-search; Other searches only.
+
+> **Confirm-on-import (opt-in):** set `CONFIRM_REPLACEMENT_IMPORT=true` and steps 6–7 are deferred — Remediarr posts an interim comment and closes only when Sonarr's On-Import webhook confirms the new file actually landed on disk (see the [setup note](#optional-settings) below).
 
 ## Quick Start
 
@@ -141,6 +144,9 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
 | `ISSUE_TYPE_AS_BUCKET` | When `true`, the issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — a user can just pick a type with no comment. Audio/Video/Subtitle delete + re-search; Other searches only. The `*_KEYWORDS` lists are unused while on. Default `false`. | `false` |
+| `CONFIRM_REPLACEMENT_IMPORT` | When `true`, a TV remediation does **not** close the issue at search time. Remediarr deletes + searches, posts an interim "re-download started" comment, and waits for Sonarr's **On Import** webhook (`POST /webhook/sonarr`) before posting success + closing — so the issue only closes once the replacement is actually on disk. If the re-search never lands, the issue stays open. TV-only. Requires the Sonarr webhook below. Default `false`. | `false` |
+
+> **Confirm-import setup (only if `CONFIRM_REPLACEMENT_IMPORT=true`):** in Sonarr, *Settings → Connect → Webhook* — URL `http://<remediarr-host>:8189/webhook/sonarr`, Method `POST`, triggers **On Import** + **On Upgrade** + **On Import Complete** (all arrive as `eventType=Download`; On Import Complete covers season-pack/batch imports, deduped idempotently). Any new file for a pending episode closes it — On Upgrade is kept so an upgrade also backstops a missed fresh-import webhook. The `WEBHOOK_HEADER_NAME/VALUE` header (set under *Advanced → Headers*, same secret as the Jellyseerr webhook) is the **only** auth on this endpoint — the HMAC `WEBHOOK_SHARED_SECRET` does not protect it. Runs in-process: register + confirm must hit the same worker (single-worker deployment).
 
 ### Keyword Customization
 
@@ -234,6 +240,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 - `GET /health` - Simple health check  
 - `GET /health/detailed` - Health check including external services
 - `POST /webhook/jellyseerr` - Main webhook endpoint
+- `POST /webhook/sonarr` - Sonarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `GET /docs` - Interactive API documentation
 
 ## Troubleshooting
