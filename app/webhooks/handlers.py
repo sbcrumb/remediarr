@@ -170,7 +170,45 @@ def _bump_cooldown(issue_id: int) -> None:
     import time
     _COOLDOWN[issue_id] = time.time() + _COOLDOWN_SEC
 
+_ALL_EPISODES_SENTINELS = {"all episodes", "all", "0", ""}
+
+def _parse_episode_list_from_text(text: str, known_season: Optional[int] = None) -> List[int]:
+    """Extract specific episode numbers from free text.
+    Handles: 'episodes 3,4,5,6,22', 'ep 3-6 and 22', 'eps 3, 4, 5'.
+    Returns sorted deduplicated list, or [] if nothing specific found.
+    """
+    if not text:
+        return []
+    episodes: set = set()
+    # Match after episode/ep/eps keyword
+    for m in re.finditer(r'\bep(?:isodes?|s)?\s+([\d,\s\-\–]+(?:and\s+[\d,\s\-\–]+)*)', text, re.IGNORECASE):
+        block = m.group(1)
+        # Expand ranges like 3-6
+        for rng in re.finditer(r'(\d+)\s*[-\–]\s*(\d+)', block):
+            start, end = int(rng.group(1)), int(rng.group(2))
+            if start < end and (end - start) <= 50:
+                episodes.update(range(start, end + 1))
+        # Individual numbers
+        for n in re.finditer(r'\d+', block):
+            val = int(n.group())
+            if 1 <= val <= 999:
+                episodes.add(val)
+    if known_season is not None:
+        episodes.discard(known_season)
+    return sorted(episodes)
+
+
+def _is_all_episodes(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (int, float)) and int(value) == 0:
+        return True
+    if isinstance(value, str) and value.strip().lower() in _ALL_EPISODES_SENTINELS:
+        return True
+    return False
+
 async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
+    """Returns (series_id, series, season, episode) where episode=0 means all episodes in season."""
     issue = payload.get("issue") or {}
     media = payload.get("media") or {}
     comment = payload.get("comment") or {}
@@ -182,22 +220,28 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     # Try explicit keys first - handle both string and int values
     season_candidates = [
         issue.get("problemSeason"),  # This is the correct field name!
-        issue.get("affected_season"), 
+        issue.get("affected_season"),
         issue.get("affectedSeason"),
-        media.get("seasonNumber"), 
+        media.get("seasonNumber"),
         media.get("season")
     ]
     episode_candidates = [
         issue.get("problemEpisode"),  # This is the correct field name!
-        issue.get("affected_episode"), 
+        issue.get("affected_episode"),
         issue.get("affectedEpisode"),
-        media.get("episodeNumber"), 
+        media.get("episodeNumber"),
         media.get("episode")
     ]
-    
+
     season = None
     episode = None
-    
+    all_episodes_in_season = False
+
+    # Check if episode field explicitly signals "all episodes"
+    raw_episode = issue.get("problemEpisode") or issue.get("affected_episode") or issue.get("affectedEpisode")
+    if _is_all_episodes(raw_episode):
+        all_episodes_in_season = True
+
     # Extract season
     for candidate in season_candidates:
         if candidate is not None:
@@ -213,67 +257,74 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
             elif isinstance(candidate, (int, float)):
                 season = int(candidate)
                 break
-    
-    # Extract episode  
-    for candidate in episode_candidates:
-        if candidate is not None:
-            # Handle string values that might be numbers
-            if isinstance(candidate, str):
-                candidate = candidate.strip()
-                if candidate and not candidate.startswith("{{"):
-                    try:
-                        episode = int(candidate)
-                        break
-                    except ValueError:
-                        continue
-            elif isinstance(candidate, (int, float)):
-                episode = int(candidate)
-                break
 
-    log.info("After explicit extraction: season=%s, episode=%s", season, episode)
+    # Extract episode (skip if already flagged as all-episodes)
+    if not all_episodes_in_season:
+        for candidate in episode_candidates:
+            if candidate is not None:
+                if isinstance(candidate, str):
+                    candidate = candidate.strip()
+                    if candidate and not candidate.startswith("{{"):
+                        try:
+                            episode = int(candidate)
+                            break
+                        except ValueError:
+                            continue
+                elif isinstance(candidate, (int, float)):
+                    episode = int(candidate)
+                    break
 
-    # If we got both from explicit extraction, skip fallbacks
-    if season is not None and episode is not None:
-        log.info("Found season/episode from explicit extraction: S%02dE%02d", season, episode)
-    else:
-        # Fallback: parse from text
-        if season is None or episode is None:
-            text = " ".join([
-                str(payload.get("subject") or ""),
-                str(issue.get("issue_type") or ""),
-                str(issue.get("issue_status") or ""),
-                str(payload.get("message") or ""),
-                str(comment.get("comment_message") or ""),
-                str(comment.get("message") or "")
-            ])
-            s2, e2 = _extract_season_episode_from_text(text)
-            season = season if season is not None else s2
-            episode = episode if episode is not None else e2
-            if s2 or e2:
-                log.info("After text parsing: season=%s, episode=%s", season, episode)
+    log.info("After explicit extraction: season=%s, episode=%s, all_episodes=%s", season, episode, all_episodes_in_season)
 
-        # Fallback: walk the entire payload for season/episode
-        if season is None or episode is None:
-            s3, e3 = _walk_for_season_episode(payload)
-            season = season if season is not None else s3
-            episode = episode if episode is not None else e3
-            if s3 or e3:
-                log.info("After payload walk: season=%s, episode=%s", season, episode)
+    if not all_episodes_in_season:
+        # If we got both from explicit extraction, skip fallbacks
+        if season is not None and episode is not None:
+            log.info("Found season/episode from explicit extraction: S%02dE%02d", season, episode)
+        else:
+            # Fallback: parse from text
+            if season is None or episode is None:
+                text = " ".join([
+                    str(payload.get("subject") or ""),
+                    str(issue.get("issue_type") or ""),
+                    str(issue.get("issue_status") or ""),
+                    str(payload.get("message") or ""),
+                    str(comment.get("comment_message") or ""),
+                    str(comment.get("message") or "")
+                ])
+                s2, e2 = _extract_season_episode_from_text(text)
+                season = season if season is not None else s2
+                episode = episode if episode is not None else e2
+                if s2 or e2:
+                    log.info("After text parsing: season=%s, episode=%s", season, episode)
+
+            # Fallback: walk the entire payload for season/episode
+            if season is None or episode is None:
+                s3, e3 = _walk_for_season_episode(payload)
+                season = season if season is not None else s3
+                episode = episode if episode is not None else e3
+                if s3 or e3:
+                    log.info("After payload walk: season=%s, episode=%s", season, episode)
 
     # Get series from Sonarr
     series = await S.get_series_by_tvdb(int(tvdb_id))
     if not series:
         raise ValueError("Series not found in Sonarr")
-    
-    if season is None or episode is None:
-        raise ValueError(f"Missing season/episode after all extraction attempts: S{season}E{episode}")
-    
-    # Sanity check the values
+
+    if season is None:
+        raise ValueError("Missing season number after all extraction attempts")
+
+    # Sanity check season
     if season < 1 or season > 50:
         raise ValueError(f"Invalid season number: {season}")
+
+    # All-episodes path: return episode=0 as sentinel
+    if all_episodes_in_season or episode is None:
+        log.info("All-episodes mode for series %s season %s", series["id"], season)
+        return series["id"], series, int(season), 0
+
     if episode < 1 or episode > 1000:
         raise ValueError(f"Invalid episode number: {episode}")
-    
+
     return series["id"], series, int(season), int(episode)
 
 def _is_bazarr_enabled() -> bool:
@@ -372,6 +423,72 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
     
     await notify(f"Remediarr - Movie", f"{title}: fixed")
+
+async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    all_episode_ids: List[int] = []
+    handled_eps: List[int] = []
+
+    for ep_num in episodes:
+        ep_ids = await S.episode_ids_for(series_id, season, ep_num)
+        if not ep_ids:
+            log.info("No episode file in Sonarr for S%02dE%02d, skipping", season, ep_num)
+            continue
+        if bucket in ("audio", "video", "subtitle"):
+            removed = await S.delete_episodefiles(series_id, ep_ids)
+            log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+        all_episode_ids.extend(ep_ids)
+        handled_eps.append(ep_num)
+
+    if not handled_eps:
+        log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
+        return
+
+    await S.trigger_episode_search(all_episode_ids)
+
+    ep_list = ", ".join(f"E{e:02d}" for e in handled_eps)
+    msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+    await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
+
+
+async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    if bucket == "subtitle":
+        tvdb_id = series.get("tvdbId")
+        if tvdb_id and _is_bazarr_enabled():
+            bazarr_handled = await _handle_subtitle_with_bazarr(issue_id, "tv", tvdb_id, title, season, None)
+            if bazarr_handled:
+                if CLOSE_ISSUES:
+                    closed = await jelly_close(issue_id)
+                    log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+                return
+        log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
+
+    if bucket in ("audio", "video", "subtitle"):
+        removed = await S.delete_all_episodefiles_for_season(series_id, season)
+        log.info("Deleted %s episode files for series %s season %s", removed, series_id, season)
+
+    await S.trigger_season_search(series_id, season)
+    log.info("Triggered SeasonSearch for series %s season %s", series_id, season)
+
+    msg = f"{title} Season {season:02d}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+
+    await notify(f"Remediarr - TV Season", f"{title} Season {season}: fixed")
+
 
 async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str) -> None:
     series_id = series["id"]
@@ -549,18 +666,41 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         try:
             # Use the robust extraction method from original app.py with enriched payload
+            # episode=0 is the sentinel meaning "all episodes in season"
             series_id, series, season, episode = await _tv_episode_from_payload(enriched_payload)
-            log.info("Successfully extracted TV context: series_id=%s, S%02dE%02d", series_id, season, episode)
+            log.info("Successfully extracted TV context: series_id=%s, S%02d E%s",
+                     series_id, season, "all" if episode == 0 else f"{episode:02d}")
         except (ValueError, Exception) as e:
             log.info("TV extraction failed: %s", str(e))
             return {"ok": True, "detail": f"ignored: {str(e)}"}
+
+        if episode == 0:
+            # Check issue description + comments for a specific episode list before nuking the whole season
+            text_to_scan = " ".join([
+                str(enriched_payload.get("message") or ""),
+                str((enriched_payload.get("issue") or {}).get("message") or ""),
+                str((enriched_payload.get("comment") or {}).get("comment_message") or ""),
+            ])
+            specific_eps = _parse_episode_list_from_text(text_to_scan, known_season=season)
+
+            if specific_eps:
+                log.info("Found specific episodes in text for S%02d: %s — handling individually", season, specific_eps)
+                await _handle_tv_specific_episodes(issue_id, series, season, specific_eps, bucket)
+                _bump_cooldown(issue_id)
+                return {"ok": True, "detail": f"tv specific episodes handled: {bucket}"}
+
+            log.info("Processing TV series %s (%s) S%02d (all episodes) with bucket: %s",
+                     series_id, series.get("title"), season, bucket)
+            await _handle_tv_season(issue_id, series, season, bucket)
+            _bump_cooldown(issue_id)
+            return {"ok": True, "detail": f"tv season handled: {bucket}"}
 
         episode_ids = await S.episode_ids_for(series_id, season, episode)
         if not episode_ids:
             log.info("Sonarr: no episode ids for S%02dE%02d", season, episode)
             return {"ok": True, "detail": "ignored: episode not present"}
 
-        log.info("Processing TV series %s (%s) S%02dE%02d with bucket: %s", 
+        log.info("Processing TV series %s (%s) S%02dE%02d with bucket: %s",
                  series_id, series.get("title"), season, episode, bucket)
 
         await _handle_tv(issue_id, series, season, episode, episode_ids, bucket)
