@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     # and the confirmation (posted when Sonarr reports the import, then close).
     MSG_TV_SEARCHING: Optional[str] = None
     MSG_TV_IMPORTED: Optional[str] = None
+    MSG_MOVIE_SEARCHING: Optional[str] = None
+    MSG_MOVIE_IMPORTED: Optional[str] = None
 
     # ===== Cooldown =====
     REMEDIARR_ISSUE_COOLDOWN_SEC: int = 90
