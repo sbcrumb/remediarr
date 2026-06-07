@@ -330,6 +330,7 @@ def _radarr_import_movie_id(payload: Dict[str, Any]) -> Optional[int]:
         return None
     return mid
 
+
 async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
     """Returns (series_id, series, season, episode) where episode=0 means all episodes in season."""
     issue = payload.get("issue") or {}
@@ -560,6 +561,72 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
 
     await notify("Remediarr - Movie", f"{title}: fixed")
+
+async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    all_episode_ids: List[int] = []
+    handled_eps: List[int] = []
+
+    for ep_num in episodes:
+        ep_ids = await S.episode_ids_for(series_id, season, ep_num)
+        if not ep_ids:
+            log.info("No episode file in Sonarr for S%02dE%02d, skipping", season, ep_num)
+            continue
+        if bucket in ("audio", "video", "subtitle"):
+            removed = await S.delete_episodefiles(series_id, ep_ids)
+            log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+        all_episode_ids.extend(ep_ids)
+        handled_eps.append(ep_num)
+
+    if not handled_eps:
+        log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
+        return
+
+    await S.trigger_episode_search(all_episode_ids)
+
+    ep_list = ", ".join(f"E{e:02d}" for e in handled_eps)
+    msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+    await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
+
+
+async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    if bucket == "subtitle":
+        tvdb_id = series.get("tvdbId")
+        if tvdb_id and _is_bazarr_enabled():
+            bazarr_handled = await _handle_subtitle_with_bazarr(issue_id, "tv", tvdb_id, title, season, None)
+            if bazarr_handled:
+                if CLOSE_ISSUES:
+                    closed = await jelly_close(issue_id)
+                    log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+                return
+        log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
+
+    if bucket in ("audio", "video", "subtitle"):
+        removed = await S.delete_all_episodefiles_for_season(series_id, season)
+        log.info("Deleted %s episode files for series %s season %s", removed, series_id, season)
+
+    await S.trigger_season_search(series_id, season)
+    log.info("Triggered SeasonSearch for series %s season %s", series_id, season)
+
+    msg = f"{title} Season {season:02d}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+
+    await notify(f"Remediarr - TV Season", f"{title} Season {season}: fixed")
+
 
 async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
     series_id = series["id"]
