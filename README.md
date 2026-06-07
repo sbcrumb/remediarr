@@ -144,7 +144,7 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
 | `ISSUE_TYPE_AS_BUCKET` | When `true`, the Jellyseerr issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — users can report an issue by type alone with no keywords required. Audio/Video/Subtitle → delete + re-search; Other → search only. The `*_KEYWORDS` lists are unused while this is on. Default `false`. | `false` |
-| `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds a TV issue open after triggering a re-download and only comments + closes once Sonarr confirms the replacement actually imported. If the download never lands, the issue stays open as a signal for manual follow-up. TV/Sonarr only. Requires the Sonarr webhook setup below. Default `false`. | `false` |
+| `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds an issue open after triggering a re-download and only comments + closes once the replacement is confirmed imported. TV issues wait for Sonarr's On Import webhook; movie issues wait for Radarr's. If the download never lands, the issue stays open as a signal for manual follow-up. Requires the webhook setup below for each arr you want to confirm. Default `false`. | `false` |
 
 #### Setting up the Sonarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true`)
 
@@ -164,6 +164,20 @@ When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify i
 6. Save and use the **Test** button to verify Sonarr can reach Remediarr.
 
 > **Note:** Remediarr must be running as a single worker. If you run multiple workers (e.g. `gunicorn --workers 2`), pending import state is not shared between them and issues may not close correctly.
+
+#### Setting up the Radarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true` on movies)
+
+1. In Radarr, go to **Settings → Connect → + (Add)**
+2. Choose **Webhook**
+3. Fill in the fields:
+   - **Name:** `Remediarr`
+   - **URL:** `http://<remediarr-host>:8189/webhook/radarr`
+   - **Method:** `POST`
+4. Enable these triggers:
+   - ✅ **On Import**
+   - ✅ **On Upgrade**
+5. If you have `WEBHOOK_HEADER_NAME` and `WEBHOOK_HEADER_VALUE` set, add the same header under **Advanced → Headers** in Radarr.
+6. Save and use the **Test** button to verify Radarr can reach Remediarr.
 
 ### Keyword Customization
 
@@ -258,6 +272,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 - `GET /health/detailed` - Health check including external services
 - `POST /webhook/jellyseerr` - Main webhook endpoint
 - `POST /webhook/sonarr` - Sonarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
+- `POST /webhook/radarr` - Radarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `GET /docs` - Interactive API documentation
 
 ## Troubleshooting

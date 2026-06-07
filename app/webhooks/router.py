@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, Request, HTTPException
 
 from app.config import cfg
 from app.logging import log
-from app.webhooks.handlers import handle_jellyseerr, handle_sonarr_import
+from app.webhooks.handlers import handle_jellyseerr, handle_sonarr_import, handle_radarr_import
 
 router = APIRouter()
 
@@ -75,3 +75,14 @@ async def sonarr_webhook(req: Request):
     _verify_header(req)
     payload = await req.json()
     return await handle_sonarr_import(payload)
+
+
+@router.post("/webhook/radarr")
+async def radarr_webhook(req: Request):
+    # Radarr "On Import" Connect webhook. Used only when CONFIRM_REPLACEMENT_IMPORT
+    # is on: confirms a previously-armed movie issue's replacement actually imported,
+    # then closes the Seerr issue. Authenticated with the same custom header as the
+    # other webhooks (Radarr Connect supports custom headers but not HMAC signatures).
+    _verify_header(req)
+    payload = await req.json()
+    return await handle_radarr_import(payload)
