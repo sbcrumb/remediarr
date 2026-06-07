@@ -24,6 +24,11 @@ COMMENT_ON_ACTION = os.getenv("JELLYSEERR_COMMENT_ON_ACTION", "true").lower() ==
 # Messages - Your requested format
 MSG_MOVIE_SUCCESS = os.getenv("MSG_MOVIE_SUCCESS", "{title}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass.")
 MSG_TV_SUCCESS = os.getenv("MSG_TV_SUCCESS", "{title} S{season:02d}E{episode:02d}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass.")
+# CONFIRM_REPLACEMENT_IMPORT messages (only used when that flag is on).
+MSG_TV_SEARCHING = os.getenv("MSG_TV_SEARCHING", "{title} S{season:02d}E{episode:02d}: deleted the file and started a re-download. I'll comment here once the replacement has imported.")
+MSG_TV_IMPORTED = os.getenv("MSG_TV_IMPORTED", "{title} S{season:02d}E{episode:02d}: replacement downloaded and imported. Closing this issue. If anything's still off, comment and I'll take another pass.")
+MSG_MOVIE_SEARCHING = os.getenv("MSG_MOVIE_SEARCHING", "{title}: deleted the file and started a re-download. I'll comment here once the replacement has imported.")
+MSG_MOVIE_IMPORTED = os.getenv("MSG_MOVIE_IMPORTED", "{title}: replacement downloaded and imported. Closing this issue. If anything's still off, comment and I'll take another pass.")
 
 # Keyword buckets (lower-cased sets)
 def _csv(name: str) -> List[str]:
@@ -66,7 +71,32 @@ def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     for keyword in (MOV_OTHER | TV_OTHER):
         if keyword in t:
             return "other"
-    
+
+    return None
+
+# Seerr issue TYPE -> bucket, for ISSUE_TYPE_AS_BUCKET mode (no comment needed).
+# Ints match the upstream Overseerr/Jellyseerr IssueType enum
+# (server/constants/issue.ts: VIDEO=1, AUDIO=2, SUBTITLES=3, OTHER=4). The webhook
+# body's string `issue_type` is preferred; this int `issueType` is the fallback.
+_ISSUE_TYPE_INT_TO_BUCKET = {1: "video", 2: "audio", 3: "subtitle", 4: "other"}
+_VALID_TYPE_BUCKETS = {"audio", "video", "subtitle", "other"}
+
+def _bucket_from_issue_type(issue: Dict[str, Any]) -> Optional[str]:
+    """Derive the bucket straight from the Seerr issue TYPE (comment ignored).
+
+    Prefers the webhook-body string ``issue_type`` ("audio"/"video"/...);
+    falls back to the API integer ``issueType`` (1=video, 2=audio, 3=subtitle,
+    4=other). Returns None if neither yields a valid bucket. "wrong" is not
+    reachable here (Seerr has no "wrong" issue type) — that stays keyword-only.
+    """
+    if not issue:
+        return None
+    raw = str(issue.get("issue_type") or "").strip().lower()
+    if raw in _VALID_TYPE_BUCKETS:
+        return raw
+    iv = _to_int_or_none(issue.get("issueType"))
+    if iv in _ISSUE_TYPE_INT_TO_BUCKET:
+        return _ISSUE_TYPE_INT_TO_BUCKET[iv]
     return None
 
 def _to_int_or_none(val) -> Optional[int]:
@@ -206,6 +236,100 @@ def _is_all_episodes(value: Any) -> bool:
     if isinstance(value, str) and value.strip().lower() in _ALL_EPISODES_SENTINELS:
         return True
     return False
+
+# CONFIRM_REPLACEMENT_IMPORT: issues awaiting a Sonarr "On Import" webhook before we
+# comment success + close. Keyed by (series_id, season, episode) -> {"issue_ids": set,
+# "title": str}. One episode can have several open issues (a re-open, or two people
+# reporting the same break); all of them close on the single import. In-memory and
+# best-effort: cleared on restart (a pending issue simply stays open — fail-safe).
+_PENDING_IMPORTS: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+
+def _register_pending_import(series_id: int, season: int, episode: int,
+                             issue_id: int, title: str) -> bool:
+    """Arm an issue to be closed when Sonarr imports (series_id, season, episode).
+
+    Returns True if this is the first issue waiting on that episode (the caller
+    should delete + re-search), or False if a remediation for the same episode is
+    already in flight (the caller should NOT re-delete/re-search the in-progress
+    download — just merge this issue_id; all waiting issues close on the import).
+    """
+    key = (series_id, season, episode)
+    existing = _PENDING_IMPORTS.get(key)
+    if existing is None:
+        _PENDING_IMPORTS[key] = {"issue_ids": {issue_id}, "title": title}
+        fresh = True
+    else:
+        existing["issue_ids"].add(issue_id)
+        fresh = False
+    log.info("Awaiting Sonarr import to confirm issue %s (%s S%02dE%02d) — %s; %d episode(s) pending",
+             issue_id, title, season, episode,
+             "new remediation" if fresh else "merged into in-flight remediation",
+             len(_PENDING_IMPORTS))
+    return fresh
+
+def _sonarr_import_keys(payload: Dict[str, Any]) -> List[Tuple[int, int, int]]:
+    """Extract (series_id, season, episode) keys from a Sonarr Connect webhook.
+
+    Any "Download" import yields keys — a fresh import OR an upgrade. A new file
+    landing for a pending episode is a plausible fix regardless of why; and since
+    our remediation deletes first, the normal replacement lands as a fresh import,
+    so an upgrade event only ever matches a pending entry whose episode already
+    has a file — i.e. it usefully backstops a missed fresh-import webhook. Other
+    events (Test, Grab, Rename, health, etc.) yield none so the endpoint no-ops.
+    """
+    if (payload.get("eventType") or "") != "Download":
+        return []
+    series = payload.get("series") or {}
+    sid = series.get("id")
+    if not isinstance(sid, int):
+        return []
+    keys: List[Tuple[int, int, int]] = []
+    for ep in (payload.get("episodes") or []):
+        s = ep.get("seasonNumber")
+        e = ep.get("episodeNumber")
+        if isinstance(s, int) and isinstance(e, int):
+            keys.append((sid, s, e))
+    return keys
+
+# CONFIRM_REPLACEMENT_IMPORT (movies): issues awaiting a Radarr "On Import" webhook.
+# Keyed by radarr movie_id -> {"issue_ids": set, "title": str}. In-memory, best-effort.
+_PENDING_MOVIE_IMPORTS: Dict[int, Dict[str, Any]] = {}
+
+def _register_pending_movie_import(movie_id: int, issue_id: int, title: str) -> bool:
+    """Arm an issue to be closed when Radarr imports movie_id.
+
+    Returns True if this is the first issue waiting on that movie (caller should
+    delete + re-search), False if a remediation is already in flight (caller should
+    skip delete/search and just attach this issue_id to the existing entry).
+    """
+    existing = _PENDING_MOVIE_IMPORTS.get(movie_id)
+    if existing is None:
+        _PENDING_MOVIE_IMPORTS[movie_id] = {"issue_ids": {issue_id}, "title": title}
+        fresh = True
+    else:
+        existing["issue_ids"].add(issue_id)
+        fresh = False
+    log.info("Awaiting Radarr import to confirm issue %s (%s) — %s; %d movie(s) pending",
+             issue_id, title,
+             "new remediation" if fresh else "merged into in-flight remediation",
+             len(_PENDING_MOVIE_IMPORTS))
+    return fresh
+
+def _radarr_import_movie_id(payload: Dict[str, Any]) -> Optional[int]:
+    """Extract the Radarr movie id from a Radarr Connect webhook payload.
+
+    Returns the id on any Download event (fresh import or upgrade); returns None
+    for all other event types (Test, Grab, Rename, Health, etc.) so the endpoint
+    no-ops cleanly.
+    """
+    if (payload.get("eventType") or "") != "Download":
+        return None
+    movie = payload.get("movie") or {}
+    mid = movie.get("id")
+    if not isinstance(mid, int) or isinstance(mid, bool):
+        return None
+    return mid
+
 
 async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
     """Returns (series_id, series, season, episode) where episode=0 means all episodes in season."""
@@ -403,26 +527,106 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
         # Fall back to traditional approach if Bazarr not available or failed
         log.info("Falling back to traditional subtitle handling for movie %s", movie_id)
     
-    # Delete files if needed (traditional approach)
-    removed = 0
-    if bucket in ("audio", "video", "subtitle", "wrong"):
-        log.info("Deleting movie files for movie %s", movie_id)
-        removed = await R.delete_moviefiles(movie_id)
-        log.info("Deleted %s movie files", removed)
+    # Confirm-import mode applies only to replace buckets (audio/video/subtitle/wrong).
+    # "other"/search-only and Bazarr-handled subtitle fixes always close at action time.
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle", "wrong")
+    already_pending = confirm and movie_id in _PENDING_MOVIE_IMPORTS
 
-    # Trigger search
-    log.info("Triggering search for movie %s", movie_id)
-    await R.trigger_search_movie(movie_id)
-    
-    # Comment and close
+    # Delete + re-search unless a remediation for this movie is already in flight.
+    if not already_pending:
+        if bucket in ("audio", "video", "subtitle", "wrong"):
+            log.info("Deleting movie files for movie %s", movie_id)
+            removed = await R.delete_moviefiles(movie_id)
+            log.info("Deleted %s movie files", removed)
+        log.info("Triggering search for movie %s", movie_id)
+        await R.trigger_search_movie(movie_id)
+
+    # Confirm-import mode: register the issue as pending and post an interim comment.
+    # The Radarr "On Import" webhook (handle_radarr_import) finalizes it once the
+    # replacement is actually on disk.
+    if confirm:
+        _register_pending_movie_import(movie_id, issue_id, title)
+        if COMMENT_ON_ACTION:
+            msg = MSG_MOVIE_SEARCHING.format(title=title)
+            await jelly_comment(issue_id, f"{PREFIX} {msg}")
+        await notify("Remediarr - Movie", f"{title}: re-download started; awaiting import")
+        return
+
+    # Default: comment success + close at search time.
     msg = MSG_MOVIE_SUCCESS.format(title=title)
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
-    
-    await notify(f"Remediarr - Movie", f"{title}: fixed")
+
+    await notify("Remediarr - Movie", f"{title}: fixed")
+
+async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    all_episode_ids: List[int] = []
+    handled_eps: List[int] = []
+
+    for ep_num in episodes:
+        ep_ids = await S.episode_ids_for(series_id, season, ep_num)
+        if not ep_ids:
+            log.info("No episode file in Sonarr for S%02dE%02d, skipping", season, ep_num)
+            continue
+        if bucket in ("audio", "video", "subtitle"):
+            removed = await S.delete_episodefiles(series_id, ep_ids)
+            log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+        all_episode_ids.extend(ep_ids)
+        handled_eps.append(ep_num)
+
+    if not handled_eps:
+        log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
+        return
+
+    await S.trigger_episode_search(all_episode_ids)
+
+    ep_list = ", ".join(f"E{e:02d}" for e in handled_eps)
+    msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+    await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
+
+
+async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str) -> None:
+    series_id = series["id"]
+    title = series.get("title") or f"Series {series_id}"
+
+    if bucket == "subtitle":
+        tvdb_id = series.get("tvdbId")
+        if tvdb_id and _is_bazarr_enabled():
+            bazarr_handled = await _handle_subtitle_with_bazarr(issue_id, "tv", tvdb_id, title, season, None)
+            if bazarr_handled:
+                if CLOSE_ISSUES:
+                    closed = await jelly_close(issue_id)
+                    log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+                return
+        log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
+
+    if bucket in ("audio", "video", "subtitle"):
+        removed = await S.delete_all_episodefiles_for_season(series_id, season)
+        log.info("Deleted %s episode files for series %s season %s", removed, series_id, season)
+
+    await S.trigger_season_search(series_id, season)
+    log.info("Triggered SeasonSearch for series %s season %s", series_id, season)
+
+    msg = f"{title} Season {season:02d}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    if COMMENT_ON_ACTION:
+        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+    if CLOSE_ISSUES:
+        closed = await jelly_close(issue_id)
+        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+
+    await notify(f"Remediarr - TV Season", f"{title} Season {season}: fixed")
+
 
 async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
     series_id = series["id"]
@@ -510,26 +714,136 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
         # Fall back to traditional approach if Bazarr not available or failed
         log.info("Falling back to traditional subtitle handling for series %s", series_id)
     
-    # Delete files if needed (traditional approach)
-    removed = 0
-    if bucket in ("audio", "video", "subtitle"):
-        log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
-        removed = await S.delete_episodefiles(series_id, episode_ids)
-        log.info("Deleted %s episode files", removed)
+    # Confirm-import mode applies only to the replace buckets (audio/video/subtitle):
+    # an "other"/search-only bucket replaces nothing, so there's no import to await
+    # and it falls through to the normal comment+close below. NB Bazarr-handled
+    # subtitle fixes return early above and always close at action time (a Bazarr
+    # search produces no Sonarr import to wait for).
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle")
+    already_pending = confirm and (series_id, season, episode) in _PENDING_IMPORTS
 
-    # Trigger search
-    log.info("Triggering search for series %s episodes %s", series_id, episode_ids)
-    await S.trigger_episode_search(episode_ids)
-    
-    # Comment and close
+    # Delete + re-search — unless a remediation for this exact episode is already in
+    # flight (same download in progress); re-deleting it would be wasteful, so we
+    # just attach this issue to the existing pending entry below.
+    if not already_pending:
+        removed = 0
+        if bucket in ("audio", "video", "subtitle"):
+            log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
+            removed = await S.delete_episodefiles(series_id, episode_ids)
+            log.info("Deleted %s episode files", removed)
+        log.info("Triggering search for series %s episodes %s", series_id, episode_ids)
+        await S.trigger_episode_search(episode_ids)
+
+    # Confirm-import mode: don't claim success/close yet. Register the issue as
+    # pending and post an interim comment; the Sonarr "On Import" webhook
+    # (handle_sonarr_import) finalizes it once the replacement is actually on disk.
+    if confirm:
+        _register_pending_import(series_id, season, episode, issue_id, title)
+        if COMMENT_ON_ACTION:
+            msg = MSG_TV_SEARCHING.format(title=title, season=season, episode=episode)
+            await jelly_comment(issue_id, f"{PREFIX} {msg}")
+        await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: re-download started; awaiting import")
+        return
+
+    # Default: comment success + close at search time.
     msg = MSG_TV_SUCCESS.format(title=title, season=season, episode=episode)
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
-    
+
     await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: fixed")
+
+async def handle_sonarr_import(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sonarr "On Import" webhook entry (POST /webhook/sonarr).
+
+    Only acts when CONFIRM_REPLACEMENT_IMPORT armed an issue: matches the imported
+    episode against the pending map and, on a hit, posts the success comment +
+    closes the Seerr issue. Any import with no pending issue is a no-op.
+    """
+    keys = _sonarr_import_keys(payload)
+    if not keys:
+        return {"ok": True, "detail": "ignored: not an import event"}
+
+    handled = 0
+    for key in keys:
+        # Claim the entry atomically (pop) so a duplicate webhook — Sonarr fires
+        # both "On Import" and "On Import Complete" for the same file — sees None
+        # and no-ops instead of double-closing.
+        pending = _PENDING_IMPORTS.pop(key, None)
+        if not pending:
+            continue
+        _, season, episode = key
+        title = pending["title"]
+        issue_ids = sorted(pending["issue_ids"])
+        log.info("Sonarr import confirms %d issue(s) for %s S%02dE%02d — finalizing",
+                 len(issue_ids), title, season, episode)
+        # Finalize each issue independently: a Seerr error on one (jelly_comment
+        # raises on 4xx/5xx) must not drop the others or abort sibling keys. Only
+        # the issues that failed get re-armed, so we never lose an issue and never
+        # re-close one that already closed.
+        failed = set()
+        for issue_id in issue_ids:
+            try:
+                if COMMENT_ON_ACTION:
+                    msg = MSG_TV_IMPORTED.format(title=title, season=season, episode=episode)
+                    await jelly_comment(issue_id, f"{PREFIX} {msg}")
+                if CLOSE_ISSUES:
+                    closed = await jelly_close(issue_id)
+                    log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+            except Exception as e:
+                log.warning("Finalize failed for issue %s (%s S%02dE%02d); re-arming: %s",
+                            issue_id, title, season, episode, e)
+                failed.add(issue_id)
+        if failed:
+            _PENDING_IMPORTS[key] = {"issue_ids": failed, "title": title}
+        if len(failed) < len(issue_ids):
+            await notify(f"Remediarr - TV", f"{title} S{season:02d}E{episode:02d}: replacement imported")
+            handled += 1
+
+    if handled:
+        return {"ok": True, "detail": f"import handled: {handled}"}
+    return {"ok": True, "detail": "ignored: no pending issue for this import"}
+
+async def handle_radarr_import(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Radarr "On Import" webhook entry (POST /webhook/radarr).
+
+    Only acts when CONFIRM_REPLACEMENT_IMPORT armed an issue: matches the imported
+    movie against the pending map and, on a hit, posts the success comment +
+    closes the Seerr issue. Any import with no pending issue is a no-op.
+    """
+    movie_id = _radarr_import_movie_id(payload)
+    if movie_id is None:
+        return {"ok": True, "detail": "ignored: not an import event"}
+
+    pending = _PENDING_MOVIE_IMPORTS.pop(movie_id, None)
+    if not pending:
+        return {"ok": True, "detail": "ignored: no pending issue for this import"}
+
+    title = pending["title"]
+    issue_ids = sorted(pending["issue_ids"])
+    log.info("Radarr import confirms %d issue(s) for %s — finalizing", len(issue_ids), title)
+
+    failed = set()
+    for issue_id in issue_ids:
+        try:
+            if COMMENT_ON_ACTION:
+                msg = MSG_MOVIE_IMPORTED.format(title=title)
+                await jelly_comment(issue_id, f"{PREFIX} {msg}")
+            if CLOSE_ISSUES:
+                closed = await jelly_close(issue_id)
+                log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+        except Exception as e:
+            log.warning("Finalize failed for issue %s (%s); re-arming: %s", issue_id, title, e)
+            failed.add(issue_id)
+
+    if failed:
+        _PENDING_MOVIE_IMPORTS[movie_id] = {"issue_ids": failed, "title": title}
+    if len(failed) < len(issue_ids):
+        await notify("Remediarr - Movie", f"{title}: replacement imported")
+        return {"ok": True, "detail": "import handled"}
+    return {"ok": True, "detail": "ignored: all finalizations failed; re-armed"}
 
 async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Main webhook entry. We always fetch the issue to normalize fields."""
@@ -585,12 +899,22 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Current comment is ours; skipping.")
         return {"ok": True, "detail": "ignored: processing our own comment"}
 
-    # Bucket
-    bucket = _bucket_for(last, media_type)
-    log.info("Keyword scan: %r -> bucket=%s", last, bucket)
+    # Bucket: ISSUE_TYPE_AS_BUCKET => the Seerr issue TYPE drives the action and
+    # the comment is ignored; otherwise use the comment keyword scan (default).
+    if cfg.ISSUE_TYPE_AS_BUCKET:
+        bucket = _bucket_from_issue_type(enriched_payload.get("issue") or {})
+        log.info("Issue-type mode: issue_type -> bucket=%s", bucket)
+    else:
+        bucket = _bucket_for(last, media_type)
+        log.info("Keyword scan: %r -> bucket=%s", last, bucket)
 
     # No bucket → coach the user if coaching is enabled
     if not bucket:
+        # In issue-type mode the comment/keywords are irrelevant; don't post the
+        # keyword-coaching tip (it would be misleading).
+        if cfg.ISSUE_TYPE_AS_BUCKET:
+            log.info("Issue-type mode: no usable issue type; no action")
+            return {"ok": True, "detail": "ignored: no usable issue type"}
         log.info("No actionable keywords found")
         
         # Coaching: suggest keywords when none match, based on issue type
