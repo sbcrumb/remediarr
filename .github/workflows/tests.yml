@@ -14,3 +14,38 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt pytest
       - run: python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff vulture
+
+      # Pyflakes rules only (unused imports, redefined names/functions,
+      # undefined names) — catches duplicate/orphaned code, not style.
+      # TODO: drop `continue-on-error` once the existing findings on `dev`
+      # (duplicate imports in health.py, duplicate handlers in handlers.py)
+      # are cleaned up, then make this required.
+      - name: ruff (pyflakes)
+        continue-on-error: true
+        run: ruff check --select F app tests
+
+      # Flags functions/modules with no call sites anywhere in the repo.
+      # TODO: drop `continue-on-error` once the existing dead modules
+      # (messages.py, keyword_matcher.py, domain/keywords.py, http.py's
+      # retry_http, etc.) are removed, then make this required.
+      - name: vulture (dead code)
+        continue-on-error: true
+        run: vulture app tests vulture_whitelist.py --exclude "app/config.py"
+
+      # Catches AI-editor diff placeholders left in committed source (e.g.
+      # "...existing code..."), which silently break whatever function they
+      # land in. TODO: drop `continue-on-error` once the existing hit in
+      # messages.py is cleaned up, then make this required.
+      - name: no leftover AI-editor placeholders
+        continue-on-error: true
+        run: |
+          ! grep -rn --include="*.py" -E '\.\.\.\s*existing code|<<<<<<<|>>>>>>>|^=======$' app tests
