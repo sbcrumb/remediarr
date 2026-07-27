@@ -6,7 +6,7 @@ This guide walks you through setting up Remediarr step-by-step.
 
 Before setting up Remediarr, ensure you have:
 
-- **Jellyseerr** running and configured
+- **Jellyseerr** or **Seerr** running and configured (they share the same API, so either works)
 - **Sonarr** running with TV shows imported
 - **Radarr** running with movies imported  
 - **Docker** or **Python 3.11+** installed
@@ -24,8 +24,8 @@ Before setting up Remediarr, ensure you have:
 2. Go to **Settings → General → Security**
 3. Copy the **API Key**
 
-### Jellyseerr API Key
-1. Open Jellyseerr web interface  
+### Jellyseerr / Seerr API Key
+1. Open your Jellyseerr or Seerr web interface
 2. Go to **Settings → General**
 3. Copy the **API Key** (generate one if needed)
 
@@ -49,8 +49,8 @@ services:
       - SONARR_API_KEY=your-sonarr-api-key-here
       - RADARR_URL=http://radarr:7878
       - RADARR_API_KEY=your-radarr-api-key-here
-      - JELLYSEERR_URL=http://jellyseerr:5055
-      - JELLYSEERR_API_KEY=your-jellyseerr-api-key-here
+      - SEERR_URL=http://seerr:5055
+      - SEERR_API_KEY=your-seerr-api-key-here
       
       # Optional: Enable debug logging for initial testing
       - LOG_LEVEL=DEBUG
@@ -72,16 +72,16 @@ SONARR_URL=http://localhost:8989
 SONARR_API_KEY=your-sonarr-api-key-here
 RADARR_URL=http://localhost:7878  
 RADARR_API_KEY=your-radarr-api-key-here
-JELLYSEERR_URL=http://localhost:5055
-JELLYSEERR_API_KEY=your-jellyseerr-api-key-here
+SEERR_URL=http://localhost:5055
+SEERR_API_KEY=your-seerr-api-key-here
 
 # Enable debug for testing
 LOG_LEVEL=DEBUG
 ```
 
-## Step 3: Configure Jellyseerr Webhook
+## Step 3: Configure Jellyseerr/Seerr Webhook
 
-1. Open Jellyseerr → **Settings → Notifications → Webhooks**
+1. Open Jellyseerr/Seerr → **Settings → Notifications → Webhooks**
 2. Click **Add Webhook**
 3. Configure:
 
@@ -90,6 +90,8 @@ LOG_LEVEL=DEBUG
 | **Webhook URL** | `http://your-server-ip:8189/webhook/jellyseerr` |
 | **Request Method** | `POST` |
 | **Notification Types** | ✅ **Issue Reported** only |
+
+> Note: the path is `/webhook/jellyseerr` regardless of whether you're running Jellyseerr or Seerr — it's kept as-is so existing webhook configs don't break, and it works the same for both.
 
 4. **JSON Payload** - Copy this exactly:
 

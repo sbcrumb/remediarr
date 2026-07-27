@@ -1,17 +1,18 @@
 # Remediarr
 
-**Automated issue resolution for Jellyseerr via Sonarr & Radarr webhooks**
+**Automated issue resolution for Jellyseerr/Seerr via Sonarr & Radarr webhooks**
 
 > ⚠️ **Work in Progress**: Remediarr is under active development. Configuration options, API endpoints, and behavior may change between versions. Please check the changelog and update your configuration when upgrading. Feedback and bug reports are welcome!
 
-Remediarr is a lightweight webhook service that automatically fixes common media issues reported through Jellyseerr. When users report problems like "no audio" or "wrong movie", Remediarr detects the keywords, deletes problematic files, triggers new downloads, and closes the issue—all without manual intervention.
+Remediarr is a lightweight webhook service that automatically fixes common media issues reported through Jellyseerr or Seerr (they share the same API, so both are supported). When users report problems like "no audio" or "wrong movie", Remediarr detects the keywords, deletes problematic files, triggers new downloads, and closes the issue—all without manual intervention.
 
 ## Features
 
+- **🔌 Jellyseerr & Seerr Support**: Both are supported out of the box — they share the same API (`SEERR_URL`/`SEERR_API_KEY`)
 - **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
 - **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
-- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
+- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr/Seerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
 - **✅ Confirm-on-Import** *(opt-in)*: Hold the issue open until Sonarr confirms the replacement imported — it closes only when the file is actually on disk (`CONFIRM_REPLACEMENT_IMPORT`)
 - **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
 - **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
@@ -51,8 +52,8 @@ services:
       - SONARR_API_KEY=your-sonarr-api-key
       - RADARR_URL=http://radarr:7878  
       - RADARR_API_KEY=your-radarr-api-key
-      - JELLYSEERR_URL=http://jellyseerr:5055
-      - JELLYSEERR_API_KEY=your-jellyseerr-api-key
+      - SEERR_URL=http://seerr:5055
+      - SEERR_API_KEY=your-seerr-api-key
       
       # Optional - Bazarr subtitle integration
       - BAZARR_URL=http://bazarr:6767
@@ -78,19 +79,20 @@ docker run -d \
   -e SONARR_API_KEY=your-api-key \
   -e RADARR_URL=http://radarr:7878 \
   -e RADARR_API_KEY=your-api-key \
-  -e JELLYSEERR_URL=http://jellyseerr:5055 \
-  -e JELLYSEERR_API_KEY=your-api-key \
+  -e SEERR_URL=http://seerr:5055 \
+  -e SEERR_API_KEY=your-api-key \
   -e BAZARR_URL=http://bazarr:6767 \
   -e BAZARR_API_KEY=your-api-key \
   ghcr.io/sbcrumb/remediarr:latest
 ```
 
-## Jellyseerr Configuration
+## Jellyseerr/Seerr Configuration
 
-Configure webhooks in **Jellyseerr → Settings → Notifications → Webhooks**:
+Configure webhooks in **Jellyseerr/Seerr → Settings → Notifications → Webhooks**:
 
 ### Webhook Settings
 - **Webhook URL**: `http://your-server:8189/webhook/jellyseerr`
+  - Yes, the path says `jellyseerr` even if you're running Seerr — the endpoint name wasn't changed to avoid breaking existing webhook configs, but it works identically for both.
 - **Request Method**: `POST`
 - **Notification Types**: Check **only** "Issue Reported" (other types will cause loops)
 
@@ -134,8 +136,8 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `SONARR_API_KEY` | Sonarr API key | `abc123...` |
 | `RADARR_URL` | Radarr base URL | `http://radarr:7878` |
 | `RADARR_API_KEY` | Radarr API key | `def456...` |
-| `JELLYSEERR_URL` | Jellyseerr base URL | `http://jellyseerr:5055` |
-| `JELLYSEERR_API_KEY` | Jellyseerr API key | `ghi789...` |
+| `SEERR_URL` | Jellyseerr/Seerr base URL (legacy `JELLYSEERR_URL` still works) | `http://seerr:5055` |
+| `SEERR_API_KEY` | Jellyseerr/Seerr API key (legacy `JELLYSEERR_API_KEY` still works) | `ghi789...` |
 
 ### Optional Settings
 
@@ -143,7 +145,7 @@ Remediarr is configured entirely through environment variables. See the [complet
 |----------|-------------|---------|
 | `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
-| `ISSUE_TYPE_AS_BUCKET` | When `true`, the Jellyseerr issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — users can report an issue by type alone with no keywords required. Audio/Video/Subtitle → delete + re-search; Other → search only. The `*_KEYWORDS` lists are unused while this is on. Default `false`. | `false` |
+| `ISSUE_TYPE_AS_BUCKET` | When `true`, the Jellyseerr/Seerr issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — users can report an issue by type alone with no keywords required. Audio/Video/Subtitle → delete + re-search; Other → search only. The `*_KEYWORDS` lists are unused while this is on. Default `false`. | `false` |
 | `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds an issue open after triggering a re-download and only comments + closes once the replacement is confirmed imported. TV issues wait for Sonarr's On Import webhook; movie issues wait for Radarr's. If the download never lands, the issue stays open as a signal for manual follow-up. Requires the webhook setup below for each arr you want to confirm. Default `false`. | `false` |
 
 #### Setting up the Sonarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true`)
@@ -160,7 +162,7 @@ When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify i
    - ✅ **On Import**
    - ✅ **On Upgrade**
    - ✅ **On Import Complete**
-5. If you have `WEBHOOK_HEADER_NAME` and `WEBHOOK_HEADER_VALUE` set, add the same header under **Advanced → Headers** in Sonarr. This is the only auth available on this endpoint — the HMAC secret used by Jellyseerr does not apply here as Sonarr Connect does not support it.
+5. If you have `WEBHOOK_HEADER_NAME` and `WEBHOOK_HEADER_VALUE` set, add the same header under **Advanced → Headers** in Sonarr. This is the only auth available on this endpoint — the HMAC secret used by Jellyseerr/Seerr does not apply here as Sonarr Connect does not support it.
 6. Save and use the **Test** button to verify Sonarr can reach Remediarr.
 
 > **Note:** Remediarr must be running as a single worker. If you run multiple workers (e.g. `gunicorn --workers 2`), pending import state is not shared between them and issues may not close correctly.
@@ -270,7 +272,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 - `GET /` - Basic status and version info
 - `GET /health` - Simple health check  
 - `GET /health/detailed` - Health check including external services
-- `POST /webhook/jellyseerr` - Main webhook endpoint
+- `POST /webhook/jellyseerr` - Main webhook endpoint (this path name is unchanged for backward compat, but it's the correct endpoint for Seerr too — Jellyseerr and Seerr send the same payload)
 - `POST /webhook/sonarr` - Sonarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `POST /webhook/radarr` - Radarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `GET /docs` - Interactive API documentation
@@ -280,21 +282,21 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 ### Common Issues
 
 **"Missing tvdbId/season/episode" error**
-- Ensure your Jellyseerr webhook payload includes all the template variables
+- Ensure your Jellyseerr/Seerr webhook payload includes all the template variables
 - Check that the issue was reported with season/episode information
 
 **Issues not auto-closing**
-- Some Jellyseerr versions don't support the close API endpoint
-- Disable with `JELLYSEERR_CLOSE_ISSUES=false` if needed
+- Some Jellyseerr/Seerr versions don't support the close API endpoint
+- Disable with `SEERR_CLOSE_ISSUES=false` if needed
 - Remediarr will still comment when actions are taken
 
 **Webhook loops**  
-- Only enable "Issue Reported" in Jellyseerr webhook settings
+- Only enable "Issue Reported" in Jellyseerr/Seerr webhook settings
 - Don't enable "Issue Comment" or other event types
 
 **Files not found in Sonarr/Radarr**
 - Verify the content exists in your *arr apps
-- Check that TVDB/TMDB IDs match between Jellyseerr and your *arr apps
+- Check that TVDB/TMDB IDs match between Jellyseerr/Seerr and your *arr apps
 
 ### Debug Mode
 ```bash
