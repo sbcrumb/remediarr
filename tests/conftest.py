@@ -8,7 +8,7 @@ for _k, _v in {
     "SONARR_API_KEY": "x",
     "RADARR_URL": "http://radarr:7878",
     "RADARR_API_KEY": "x",
-    "JELLYSEERR_URL": "http://seerr:5055",
-    "JELLYSEERR_API_KEY": "x",
+    "SEERR_URL": "http://seerr:5055",
+    "SEERR_API_KEY": "x",
 }.items():
     os.environ.setdefault(_k, _v)

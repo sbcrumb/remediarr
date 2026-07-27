@@ -5,10 +5,19 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Hard-coded to prevent loops and user customization
 BOT_PREFIX = "[Remediarr]"
+
+
+def env_alias(new_name: str, old_name: str, default: str = "") -> str:
+    """Read new_name, falling back to old_name for backward compat (e.g. SEERR_* vs legacy JELLYSEERR_*)."""
+    val = os.getenv(new_name)
+    if val is not None:
+        return val
+    return os.getenv(old_name, default)
 
 
 def _detect_version() -> str:
@@ -67,8 +76,10 @@ class Settings(BaseSettings):
     RADARR_API_KEY: str
     RADARR_HTTP_TIMEOUT: int = 60
 
-    JELLYSEERR_URL: str
-    JELLYSEERR_API_KEY: str
+    # SEERR_* is the canonical name; JELLYSEERR_* is accepted for backward
+    # compat since Jellyseerr/Seerr/Overseerr-based apps all speak the same API.
+    SEERR_URL: str = Field(validation_alias=AliasChoices("SEERR_URL", "JELLYSEERR_URL"))
+    SEERR_API_KEY: str = Field(validation_alias=AliasChoices("SEERR_API_KEY", "JELLYSEERR_API_KEY"))
 
     BAZARR_URL: Optional[str] = None
     BAZARR_API_KEY: Optional[str] = None
@@ -77,8 +88,8 @@ class Settings(BaseSettings):
     BAZARR_FORCE_REDOWNLOAD: bool = False
 
     # ===== Behavior toggles =====
-    JELLYSEERR_CLOSE_ISSUES: bool = True
-    JELLYSEERR_COMMENT_ON_ACTION: bool = True
+    SEERR_CLOSE_ISSUES: bool = Field(default=True, validation_alias=AliasChoices("SEERR_CLOSE_ISSUES", "JELLYSEERR_CLOSE_ISSUES"))
+    SEERR_COMMENT_ON_ACTION: bool = Field(default=True, validation_alias=AliasChoices("SEERR_COMMENT_ON_ACTION", "JELLYSEERR_COMMENT_ON_ACTION"))
     # When true, the Seerr issue TYPE (audio/video/subtitle/other) drives the
     # remediation action and the comment is ignored. OFF by default.
     ISSUE_TYPE_AS_BUCKET: bool = False

@@ -12,14 +12,14 @@ from app.services import radarr as R
 from app.services import sonarr as S
 from app.services import bazarr as B
 from app.services.notify import notify
-from app.config import cfg
+from app.config import cfg, env_alias
 
 log = logging.getLogger("remediarr")
 
 # env/config
-PREFIX = os.getenv("JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
-CLOSE_ISSUES = os.getenv("JELLYSEERR_CLOSE_ISSUES", "true").lower() == "true"
-COMMENT_ON_ACTION = os.getenv("JELLYSEERR_COMMENT_ON_ACTION", "true").lower() == "true"
+PREFIX = env_alias("SEERR_BOT_COMMENT_PREFIX", "JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
+CLOSE_ISSUES = env_alias("SEERR_CLOSE_ISSUES", "JELLYSEERR_CLOSE_ISSUES", "true").lower() == "true"
+COMMENT_ON_ACTION = env_alias("SEERR_COMMENT_ON_ACTION", "JELLYSEERR_COMMENT_ON_ACTION", "true").lower() == "true"
 
 # Messages - Your requested format
 MSG_MOVIE_SUCCESS = os.getenv("MSG_MOVIE_SUCCESS", "{title}: replaced file; new download grabbed. Closing this issue. If anything's still off, comment and I'll take another pass.")
