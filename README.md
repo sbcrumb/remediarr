@@ -92,6 +92,7 @@ Configure webhooks in **Jellyseerr/Seerr → Settings → Notifications → Webh
 
 ### Webhook Settings
 - **Webhook URL**: `http://your-server:8189/webhook/jellyseerr`
+  - Yes, the path says `jellyseerr` even if you're running Seerr — the endpoint name wasn't changed to avoid breaking existing webhook configs, but it works identically for both.
 - **Request Method**: `POST`
 - **Notification Types**: Check **only** "Issue Reported" (other types will cause loops)
 
@@ -271,7 +272,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 - `GET /` - Basic status and version info
 - `GET /health` - Simple health check  
 - `GET /health/detailed` - Health check including external services
-- `POST /webhook/jellyseerr` - Main webhook endpoint
+- `POST /webhook/jellyseerr` - Main webhook endpoint (this path name is unchanged for backward compat, but it's the correct endpoint for Seerr too — Jellyseerr and Seerr send the same payload)
 - `POST /webhook/sonarr` - Sonarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `POST /webhook/radarr` - Radarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `GET /docs` - Interactive API documentation
