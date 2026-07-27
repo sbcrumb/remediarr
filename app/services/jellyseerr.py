@@ -3,11 +3,13 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 import httpx
 
+from app.config import env_alias
+
 log = logging.getLogger("remediarr")
 
-BASE = os.getenv("JELLYSEERR_URL", "").rstrip("/")
-API_KEY = os.getenv("JELLYSEERR_API_KEY", "")
-PREFIX = os.getenv("JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
+BASE = env_alias("SEERR_URL", "JELLYSEERR_URL").rstrip("/")
+API_KEY = env_alias("SEERR_API_KEY", "JELLYSEERR_API_KEY")
+PREFIX = env_alias("SEERR_BOT_COMMENT_PREFIX", "JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
 
 _headers = {"X-Api-Key": API_KEY} if API_KEY else {}
 
