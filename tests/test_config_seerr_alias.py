@@ -1,10 +1,6 @@
 """SEERR_* is the canonical name; JELLYSEERR_* must keep working for existing
 setups (Jellyseerr/Seerr/Overseerr-based apps all speak the same API)."""
 
-import os
-
-import pytest
-
 from app.config import Settings, env_alias
 
 BASE_ENV = {
