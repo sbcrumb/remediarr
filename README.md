@@ -8,10 +8,11 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 
 ## Features
 
+- **🔌 Jellyseerr & Seerr Support**: Both are supported out of the box — they share the same API (`SEERR_URL`/`SEERR_API_KEY`)
 - **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
 - **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
-- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
+- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr/Seerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
 - **✅ Confirm-on-Import** *(opt-in)*: Hold the issue open until Sonarr confirms the replacement imported — it closes only when the file is actually on disk (`CONFIRM_REPLACEMENT_IMPORT`)
 - **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
 - **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
@@ -160,7 +161,7 @@ When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify i
    - ✅ **On Import**
    - ✅ **On Upgrade**
    - ✅ **On Import Complete**
-5. If you have `WEBHOOK_HEADER_NAME` and `WEBHOOK_HEADER_VALUE` set, add the same header under **Advanced → Headers** in Sonarr. This is the only auth available on this endpoint — the HMAC secret used by Jellyseerr does not apply here as Sonarr Connect does not support it.
+5. If you have `WEBHOOK_HEADER_NAME` and `WEBHOOK_HEADER_VALUE` set, add the same header under **Advanced → Headers** in Sonarr. This is the only auth available on this endpoint — the HMAC secret used by Jellyseerr/Seerr does not apply here as Sonarr Connect does not support it.
 6. Save and use the **Test** button to verify Sonarr can reach Remediarr.
 
 > **Note:** Remediarr must be running as a single worker. If you run multiple workers (e.g. `gunicorn --workers 2`), pending import state is not shared between them and issues may not close correctly.
