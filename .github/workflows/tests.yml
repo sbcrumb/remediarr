@@ -34,18 +34,12 @@ jobs:
         run: ruff check --select F app tests
 
       # Flags functions/modules with no call sites anywhere in the repo.
-      # TODO: drop `continue-on-error` once the existing dead modules
-      # (messages.py, keyword_matcher.py, domain/keywords.py, http.py's
-      # retry_http, etc.) are removed, then make this required.
       - name: vulture (dead code)
-        continue-on-error: true
         run: vulture app tests vulture_whitelist.py --exclude "app/config.py"
 
       # Catches AI-editor diff placeholders left in committed source (e.g.
       # "...existing code..."), which silently break whatever function they
-      # land in. TODO: drop `continue-on-error` once the existing hit in
-      # messages.py is cleaned up, then make this required.
+      # land in.
       - name: no leftover AI-editor placeholders
-        continue-on-error: true
         run: |
           ! grep -rn --include="*.py" -E '\.\.\.\s*existing code|<<<<<<<|>>>>>>>|^=======$' app tests
