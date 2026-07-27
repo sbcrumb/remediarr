@@ -1,0 +1,14 @@
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pyflakes only: unused imports, redefined names/functions, undefined names,
+# unused variables. This is what catches duplicate function definitions and
+# orphaned modules — not a style/formatting linter, so it won't fight the
+# existing code style.
+select = ["F"]
+
+[tool.vulture]
+min_confidence = 60
+paths = ["app", "tests"]
+exclude = ["vulture_whitelist.py"]
