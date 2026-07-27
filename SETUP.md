@@ -91,6 +91,8 @@ LOG_LEVEL=DEBUG
 | **Request Method** | `POST` |
 | **Notification Types** | ✅ **Issue Reported** only |
 
+> Note: the path is `/webhook/jellyseerr` regardless of whether you're running Jellyseerr or Seerr — it's kept as-is so existing webhook configs don't break, and it works the same for both.
+
 4. **JSON Payload** - Copy this exactly:
 
 ```json
