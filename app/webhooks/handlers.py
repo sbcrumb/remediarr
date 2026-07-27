@@ -3,7 +3,6 @@ import re
 import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple, List
-from datetime import datetime
 
 from app.services.jellyseerr import (
     jelly_fetch_issue, jelly_last_human_comment, jelly_comment, jelly_close, is_our_comment

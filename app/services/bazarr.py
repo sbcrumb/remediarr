@@ -52,38 +52,6 @@ async def get_movie_by_tmdb(tmdb: int) -> Optional[Dict[str, Any]]:
             return movie
     return None
 
-async def search_episode_subtitles(series_id: int, episode_id: int, language: Optional[str] = None) -> bool:
-    """Search for subtitles for a specific episode."""
-    if language is None:
-        language = _get_preferred_language()
-        
-    try:
-        # Try to trigger subtitle search for episode
-        body = {
-            "episodePath": "",  # Will be populated by Bazarr
-            "sceneName": "",
-            "language": language,
-            "hi": False,
-            "forced": False
-        }
-        
-        r = await _client_lazy().post(
-            f"{API}/episodes/{episode_id}/subtitles", 
-            headers=HEADERS, 
-            json=body
-        )
-        
-        if r.status_code in (200, 201, 202):
-            log.info("Bazarr: triggered subtitle search for episode %s", episode_id)
-            return True
-        else:
-            log.warning("Bazarr: subtitle search failed for episode %s: %s", episode_id, r.status_code)
-            return False
-            
-    except Exception as e:
-        log.error("Bazarr: error searching subtitles for episode %s: %s", episode_id, e)
-        return False
-
 async def search_movie_subtitles(movie_id: int, language: Optional[str] = None) -> bool:
     """Search for subtitles for a specific movie."""
     if language is None:
@@ -115,45 +83,6 @@ async def search_movie_subtitles(movie_id: int, language: Optional[str] = None) 
     except Exception as e:
         log.error("Bazarr: error searching subtitles for movie %s: %s", movie_id, e)
         return False
-
-async def delete_episode_subtitles(episode_id: int, language: Optional[str] = None) -> int:
-    """Delete existing subtitles for an episode to force re-download."""
-    if language is None:
-        language = _get_preferred_language()
-        
-    # Only delete if force redownload is enabled
-    if not _should_force_redownload():
-        log.info("Bazarr: skipping subtitle deletion (force redownload disabled)")
-        return 0
-        
-    try:
-        # Get episode details to find subtitle files
-        r = await _client_lazy().get(f"{API}/episodes/{episode_id}", headers=HEADERS)
-        if r.status_code != 200:
-            log.warning("Bazarr: could not get episode %s details", episode_id)
-            return 0
-            
-        episode_data = r.json()
-        subtitles = episode_data.get("subtitles", [])
-        
-        deleted = 0
-        for subtitle in subtitles:
-            if subtitle.get("code2") == language:
-                subtitle_id = subtitle.get("id")
-                if subtitle_id:
-                    del_r = await _client_lazy().delete(
-                        f"{API}/episodes/{episode_id}/subtitles/{subtitle_id}", 
-                        headers=HEADERS
-                    )
-                    if del_r.status_code in (200, 204):
-                        deleted += 1
-                        log.info("Bazarr: deleted subtitle %s for episode %s", subtitle_id, episode_id)
-        
-        return deleted
-        
-    except Exception as e:
-        log.error("Bazarr: error deleting subtitles for episode %s: %s", episode_id, e)
-        return 0
 
 async def delete_movie_subtitles(movie_id: int, language: Optional[str] = None) -> int:
     """Delete existing subtitles for a movie to force re-download."""
@@ -213,23 +142,6 @@ async def trigger_wanted_search(media_type: str = "both") -> bool:
     except Exception as e:
         log.error("Bazarr: error triggering wanted search: %s", e)
         return False
-
-async def get_episode_by_sonarr_id(sonarr_episode_id: int) -> Optional[Dict[str, Any]]:
-    """Get Bazarr episode by Sonarr episode ID."""
-    try:
-        # This may need adjustment based on actual Bazarr API structure
-        r = await _client_lazy().get(f"{API}/episodes", headers=HEADERS)
-        r.raise_for_status()
-        episodes = r.json() or []
-        
-        for episode in episodes:
-            if episode.get("sonarrEpisodeId") == sonarr_episode_id:
-                return episode
-        return None
-        
-    except Exception as e:
-        log.error("Bazarr: error getting episode by Sonarr ID %s: %s", sonarr_episode_id, e)
-        return None
 
 async def get_movie_by_radarr_id(radarr_movie_id: int) -> Optional[Dict[str, Any]]:
     """Get Bazarr movie by Radarr movie ID."""

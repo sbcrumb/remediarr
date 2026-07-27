@@ -2,7 +2,6 @@ import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
-from datetime import datetime, timezone
 
 log = logging.getLogger("remediarr")
 
@@ -62,10 +61,6 @@ async def trigger_episode_search(episode_ids: List[int]) -> None:
     r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
     r.raise_for_status()
 
-async def get_all_episode_ids_for_season(series_id: int, season: int) -> List[int]:
-    eps = await list_episodes(series_id)
-    return [e["id"] for e in eps if e.get("seasonNumber") == season and isinstance(e.get("id"), int)]
-
 async def delete_all_episodefiles_for_season(series_id: int, season: int) -> int:
     eps = await list_episodes(series_id)
     file_ids = [
@@ -85,55 +80,3 @@ async def trigger_season_search(series_id: int, season: int) -> None:
     r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
     r.raise_for_status()
 
-def _parse_history_listish(data: Any) -> List[Dict[str, Any]]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and isinstance(data.get("records"), list):
-        return data["records"]
-    return []
-
-def _to_dt(s: str) -> Optional[datetime]:
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-async def latest_grab_timestamp(series_id: int, episode_ids: List[int]) -> Optional[datetime]:
-    client = _client_lazy()
-    urls = [
-        f"{API}/history/series?seriesId={series_id}&page=1&pageSize=50&sortDirection=descending",
-        f"{API}/history?seriesId={series_id}&page=1&pageSize=50&sortDirection=descending",
-    ]
-    for url in urls:
-        r = await client.get(url, headers=HEADERS)
-        if r.status_code >= 400:
-            log.info("Sonarr GET %s failed: %s", url.replace(API, "/api/v3"), r.status_code)
-            continue
-        for ev in _parse_history_listish(r.json()):
-            if (ev.get("eventType") or "").lower() == "grabbed":
-                data = ev.get("data") or {}
-                eid = data.get("episodeId")
-                dt = _to_dt(ev.get("date") or "")
-                if dt and (not episode_ids or eid in episode_ids):
-                    return dt
-    return None
-
-async def has_new_grab_since(series_id: int, episode_ids: List[int], baseline: Optional[datetime]) -> bool:
-    client = _client_lazy()
-    urls = [
-        f"{API}/history/series?seriesId={series_id}&page=1&pageSize=50&sortDirection=descending",
-        f"{API}/history?seriesId={series_id}&page=1&pageSize=50&sortDirection=descending",
-        f"{API}/history?seriesId={series_id}&page=1&pageSize=50&sortDirection=descending",
-    ]
-    for url in urls:
-        r = await client.get(url, headers=HEADERS)
-        if r.status_code >= 400:
-            continue
-        for ev in _parse_history_listish(r.json()):
-            if (ev.get("eventType") or "").lower() == "grabbed":
-                data = ev.get("data") or {}
-                eid = data.get("episodeId")
-                dt = _to_dt(ev.get("date") or "")
-                if dt and (baseline is None or dt > baseline) and (not episode_ids or eid in episode_ids):
-                    return True
-    return False
