@@ -15,6 +15,18 @@ from app.config import cfg, env_alias
 
 log = logging.getLogger("remediarr")
 
+
+class AllSeasonsAmbiguousError(ValueError):
+    """Issue targets 'All Seasons' and we cannot safely pick one."""
+    def __init__(self, season_count: int, title: str):
+        self.season_count = season_count
+        self.title = title
+        super().__init__(
+            f"All Seasons selected for '{title}' "
+            f"({season_count} seasons have files — too destructive)."
+        )
+
+
 # env/config
 PREFIX = env_alias("SEERR_BOT_COMMENT_PREFIX", "JELLYSEERR_BOT_COMMENT_PREFIX", "[Remediarr]")
 CLOSE_ISSUES = env_alias("SEERR_CLOSE_ISSUES", "JELLYSEERR_CLOSE_ISSUES", "true").lower() == "true"
@@ -432,6 +444,30 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
     series = await S.get_series_by_tvdb(int(tvdb_id))
     if not series:
         raise ValueError("Series not found in Sonarr")
+
+    # --- "All Seasons" sentinel (problemSeason=0) ---
+    # The reporter sends season=0 when the user picks "All Seasons". That could
+    # mean deleting every episode file on disk — too destructive to do blindly.
+    # Instead, count how many seasons actually have files:
+    #   1 season  → auto-target that one
+    #   >1 season → refuse and leave a comment explaining why
+    #   0 seasons → nothing to fix, skip gracefully
+    if season == 0:
+        title = series.get("title") or f"Series {series['id']}"
+        only_season = await S.get_only_season_with_files(series["id"])
+        if only_season is not None:
+            season = only_season
+            log.info(
+                "All Seasons selected for '%s' but only season %s has files — auto-targeting",
+                title, season,
+            )
+        else:
+            count = await S.count_seasons_with_files(series["id"])
+            if count == 0:
+                raise ValueError(
+                    f"No episode files on disk for '{title}' — nothing to remediate."
+                )
+            raise AllSeasonsAmbiguousError(count, title)
 
     if season is None:
         raise ValueError("Missing season number after all extraction attempts")
@@ -927,6 +963,19 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             series_id, series, season, episode = await _tv_episode_from_payload(enriched_payload)
             log.info("Successfully extracted TV context: series_id=%s, S%02d E%s",
                      series_id, season, "all" if episode == 0 else f"{episode:02d}")
+        except AllSeasonsAmbiguousError as e:
+            log.info("TV extraction skipped: %s", e)
+            if COMMENT_ON_ACTION:
+                msg = (
+                    f"{PREFIX} This issue targets **all {e.season_count} seasons** of "
+                    f"'{e.title}' — too destructive to remediate automatically. "
+                    f"Please file separate issues for specific seasons or episodes."
+                )
+                await jelly_comment(issue_id, msg)
+            if CLOSE_ISSUES:
+                closed = await jelly_close(issue_id)
+                log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+            return {"ok": True, "detail": f"ignored: {e}"}
         except (ValueError, Exception) as e:
             log.info("TV extraction failed: %s", str(e))
             return {"ok": True, "detail": f"ignored: {str(e)}"}
