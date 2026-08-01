@@ -147,6 +147,7 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
 | `ISSUE_TYPE_AS_BUCKET` | When `true`, the Jellyseerr/Seerr issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — users can report an issue by type alone with no keywords required. Audio/Video/Subtitle → delete + re-search; Other → search only. The `*_KEYWORDS` lists are unused while this is on. Default `false`. | `false` |
 | `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds an issue open after triggering a re-download and only comments + closes once the replacement is confirmed imported. TV issues wait for Sonarr's On Import webhook; movie issues wait for Radarr's. If the download never lands, the issue stays open as a signal for manual follow-up. Requires the webhook setup below for each arr you want to confirm. Default `false`. | `false` |
+| `BLOCKLIST_ON_REPLACE` | When `true`, Remediarr marks the grab that produced the bad file as **failed** in Radarr/Sonarr before deleting it, which adds that release to the arr's **Blocklist**. The re-search then skips it instead of potentially grabbing the same broken release again. Blocklisting matches an exact release, not the content — a different upload of the same bad encode can still return. Entries stay until removed in *Activity → Blocklist*. Default `false`. | `false` |
 
 #### Setting up the Sonarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true`)
 
