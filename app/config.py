@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     # (search-only) and Bazarr-handled subtitle fixes still close at action time,
     # since neither produces a Sonarr import to wait for.
     CONFIRM_REPLACEMENT_IMPORT: bool = False
+    # When true, before deleting a file Remediarr marks the grab that produced it as
+    # failed in Radarr/Sonarr, which blocklists that release. Without this, a
+    # re-search can grab the exact same broken release again and nothing changes.
+    # OFF by default — the existing behavior is unchanged.
+    BLOCKLIST_ON_REPLACE: bool = False
 
     # ===== Keyword buckets (comma-separated) =====
     TV_AUDIO_KEYWORDS: str = "no audio,no sound,missing audio,audio issue,wrong language,not in english"
