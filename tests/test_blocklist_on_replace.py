@@ -163,3 +163,33 @@ def test_radarr_no_import_falls_back_to_newest_grab(monkeypatch, blocked):
     blocked_count = asyncio.run(R.blocklist_current_release(movie_id=1))
     assert blocked_count == 1
     assert blocked == [("Radarr", 701)]
+
+
+def test_season_wide_blocklist_calls_get_all_episode_ids_for_season(monkeypatch, blocked):
+    # Regression test: _handle_tv_season's blocklist step calls
+    # S.get_all_episode_ids_for_season, which was deleted as dead code in an
+    # earlier cleanup pass and then silently reintroduced as a real call
+    # site by the blocklist feature during a later rebase — the function
+    # itself never came back, so this raised AttributeError in production
+    # any time a season-wide remediation ran with BLOCKLIST_ON_REPLACE=true.
+    assert hasattr(S, "get_all_episode_ids_for_season")
+
+    async def fake_list_episodes(series_id):
+        return [
+            {"id": 1, "seasonNumber": 2, "episodeNumber": 1},
+            {"id": 2, "seasonNumber": 2, "episodeNumber": 2},
+            {"id": 3, "seasonNumber": 3, "episodeNumber": 1},
+        ]
+
+    async def fake_history(series_id):
+        return []
+
+    monkeypatch.setattr(S, "list_episodes", fake_list_episodes)
+    monkeypatch.setattr(S, "_history_for_series", fake_history)
+
+    # Exercises the exact call handlers.py makes: get the season's episode
+    # ids, then blocklist them. Must not raise, and must only include season 2.
+    episode_ids = asyncio.run(S.get_all_episode_ids_for_season(series_id=42, season=2))
+    blocked_count = asyncio.run(S.blocklist_current_releases(series_id=42, episode_ids=episode_ids))
+    assert episode_ids == [1, 2]
+    assert blocked_count == 0
