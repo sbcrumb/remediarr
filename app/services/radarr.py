@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import httpx
 
 from app.services import arr_history as H
