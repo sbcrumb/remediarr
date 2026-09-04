@@ -17,14 +17,16 @@ log = logging.getLogger("remediarr")
 
 
 class AllSeasonsAmbiguousError(ValueError):
-    """Issue targets 'All Seasons' and we cannot safely pick one."""
+    """Issue targets 'All Seasons' and we cannot safely pick one season
+    (season_count=0: nothing has files; season_count>1: too destructive)."""
     def __init__(self, season_count: int, title: str):
         self.season_count = season_count
         self.title = title
-        super().__init__(
-            f"All Seasons selected for '{title}' "
-            f"({season_count} seasons have files — too destructive)."
-        )
+        if season_count == 0:
+            reason = "no seasons have files — nothing to remediate"
+        else:
+            reason = f"{season_count} seasons have files — too destructive"
+        super().__init__(f"All Seasons selected for '{title}' ({reason}).")
 
 
 # env/config
@@ -446,34 +448,37 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
         raise ValueError("Series not found in Sonarr")
 
     # --- "All Seasons" sentinel (problemSeason=0) ---
-    # The reporter sends season=0 when the user picks "All Seasons". That could
-    # mean deleting every episode file on disk — too destructive to do blindly.
-    # Instead, count how many seasons actually have files:
-    #   1 season  → auto-target that one
-    #   >1 season → refuse and leave a comment explaining why
-    #   0 seasons → nothing to fix, skip gracefully
-    if season == 0:
+    # The reporter sends season=0 both when the user picks "All Seasons" AND
+    # when they report a specific episode within season 0 ("Specials") — the
+    # payload alone can't tell these apart. Only treat it as the "All Seasons"
+    # sentinel when there's no specific episode number attached; a real
+    # Specials episode report (season=0, episode=<N>) falls through untouched
+    # and is handled like any other specific-episode report.
+    if season == 0 and (all_episodes_in_season or episode is None):
         title = series.get("title") or f"Series {series['id']}"
-        only_season = await S.get_only_season_with_files(series["id"])
-        if only_season is not None:
-            season = only_season
+        # That could mean deleting every episode file on disk — too destructive
+        # to do blindly. Instead, look at how many seasons actually have files:
+        #   1 season  → auto-target that one
+        #   >1 season → refuse and leave a comment explaining why
+        #   0 seasons → nothing to fix, comment + close
+        seasons_with_files = await S.get_seasons_with_files(series["id"])
+        if len(seasons_with_files) == 1:
+            season = next(iter(seasons_with_files))
             log.info(
                 "All Seasons selected for '%s' but only season %s has files — auto-targeting",
                 title, season,
             )
         else:
-            count = await S.count_seasons_with_files(series["id"])
-            if count == 0:
-                raise ValueError(
-                    f"No episode files on disk for '{title}' — nothing to remediate."
-                )
-            raise AllSeasonsAmbiguousError(count, title)
+            raise AllSeasonsAmbiguousError(len(seasons_with_files), title)
 
     if season is None:
         raise ValueError("Missing season number after all extraction attempts")
 
-    # Sanity check season
-    if season < 1 or season > 50:
+    # Sanity check season. 0 is allowed through here: it can only still be 0
+    # at this point if it's a genuine Specials report that skipped the
+    # "All Seasons" sentinel block above (that block always either
+    # reassigns season to a real number or raises before reaching here).
+    if season < 0 or season > 50:
         raise ValueError(f"Invalid season number: {season}")
 
     # All-episodes path: return episode=0 as sentinel
@@ -966,11 +971,19 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         except AllSeasonsAmbiguousError as e:
             log.info("TV extraction skipped: %s", e)
             if COMMENT_ON_ACTION:
-                msg = (
-                    f"{PREFIX} This issue targets **all {e.season_count} seasons** of "
-                    f"'{e.title}' — too destructive to remediate automatically. "
-                    f"Please file separate issues for specific seasons or episodes."
-                )
+                if e.season_count == 0:
+                    msg = (
+                        f"{PREFIX} All Seasons was reported for '{e.title}', but no "
+                        f"episode files were found on disk — nothing to remediate. If "
+                        f"specific episodes are missing, please report the specific "
+                        f"season/episode instead."
+                    )
+                else:
+                    msg = (
+                        f"{PREFIX} This issue targets **all {e.season_count} seasons** of "
+                        f"'{e.title}' — too destructive to remediate automatically. "
+                        f"Please file separate issues for specific seasons or episodes."
+                    )
                 await jelly_comment(issue_id, msg)
             if CLOSE_ISSUES:
                 closed = await jelly_close(issue_id)
