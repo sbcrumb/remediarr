@@ -80,3 +80,15 @@ async def trigger_season_search(series_id: int, season: int) -> None:
     r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
     r.raise_for_status()
 
+async def get_seasons_with_files(series_id: int) -> set[int]:
+    """Return the set of season numbers (excluding season 0/specials) that
+    have at least one episode file on disk. One Sonarr fetch; callers derive
+    both "how many" and "which one" from the same result instead of each
+    re-fetching the episode list."""
+    eps = await list_episodes(series_id)
+    seasons: set[int] = set()
+    for e in eps:
+        sn = e.get("seasonNumber")
+        if isinstance(sn, int) and sn > 0 and e.get("hasFile"):
+            seasons.add(sn)
+    return seasons
