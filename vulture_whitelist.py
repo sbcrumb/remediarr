@@ -10,3 +10,4 @@ jellyseerr_webhook  # app/webhooks/router.py — FastAPI route
 sonarr_webhook  # app/webhooks/router.py — FastAPI route
 radarr_webhook  # app/webhooks/router.py — FastAPI route
 _clean_pending  # tests/test_router_auth.py — pytest autouse fixture
+_stub_series  # tests/test_all_seasons_season0.py — pytest autouse fixture
