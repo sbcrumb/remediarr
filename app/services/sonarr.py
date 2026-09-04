@@ -40,6 +40,10 @@ async def episode_ids_for(series_id: int, season: int, episode: int) -> List[int
                 ids.append(e["id"])
     return ids
 
+async def get_all_episode_ids_for_season(series_id: int, season: int) -> List[int]:
+    eps = await list_episodes(series_id)
+    return [e["id"] for e in eps if e.get("seasonNumber") == season and isinstance(e.get("id"), int)]
+
 async def delete_episodefiles(series_id: int, episode_ids: List[int]) -> int:
     eps = await list_episodes(series_id)
     file_ids: List[int] = []
