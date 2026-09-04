@@ -652,8 +652,16 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
         # would double-blocklist it and fire a second redownload.
         await _blocklist_episodes(series_id, all_episode_ids)
         for ep_num, ep_ids in handled_eps:
-            removed = await S.delete_episodefiles(series_id, ep_ids)
-            log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+            # One episode's delete failing (e.g. a Sonarr timeout) shouldn't abort
+            # the whole batch — every other episode here was just blocklisted above,
+            # so skipping the rest of the loop on an exception would leave them
+            # blocklisted but never actually deleted/re-searched, which is worse
+            # than not blocklisting at all.
+            try:
+                removed = await S.delete_episodefiles(series_id, ep_ids)
+                log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
+            except Exception as e:
+                log.warning("Failed to delete files for S%02dE%02d: %s", season, ep_num, e)
 
     await S.trigger_episode_search(all_episode_ids)
 

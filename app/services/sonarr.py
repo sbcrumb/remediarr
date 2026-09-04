@@ -3,6 +3,8 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
+from app.services import arr_history as H
+
 log = logging.getLogger("remediarr")
 
 BASE = os.getenv("SONARR_URL", "").rstrip("/")
@@ -92,3 +94,97 @@ async def get_seasons_with_files(series_id: int) -> set[int]:
         if isinstance(sn, int) and sn > 0 and e.get("hasFile"):
             seasons.add(sn)
     return seasons
+
+
+def _episode_id(ev: Dict[str, Any]) -> Optional[int]:
+    eid = ev.get("episodeId")
+    if not isinstance(eid, int):
+        eid = (ev.get("data") or {}).get("episodeId")
+    try:
+        return int(eid)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _history_for_series(series_id: int) -> List[Dict[str, Any]]:
+    return await H.fetch_history(
+        _client_lazy(), API, HEADERS,
+        urls=[
+            f"{API}/history/series?seriesId={series_id}",
+            f"{API}/history?seriesId={series_id}&page=1&pageSize=200&sortDirection=descending",
+        ],
+        id_field="seriesId", id_value=series_id, arr_name="Sonarr",
+    )
+
+
+async def blocklist_current_releases(series_id: int, episode_ids: List[int]) -> int:
+    """
+    Blocklist the release(s) that produced the episode files currently on disk, so a
+    re-search cannot grab the exact same (broken) release again.
+
+    Sonarr has no "add to blocklist" endpoint; the supported path is marking the
+    'grabbed' history record as failed (what the UI's "Mark as Failed" button does),
+    which blocklists that release. A season pack yields one grab shared by many
+    episodes, so downloadIds are de-duplicated. Returns how many were blocklisted.
+    """
+    if not episode_ids:
+        return 0
+    events = await _history_for_series(series_id)
+    if not events:
+        log.info("Series %s: no history to blocklist", series_id)
+        return 0
+
+    wanted = set(episode_ids)
+
+    # Resolve each wanted episode INDEPENDENTLY to the downloadId of the release
+    # currently on disk for it: the newest event (import or grab) for that
+    # episode. An import is always newer than its own grab, so it naturally wins
+    # when present; if the episode hasn't been imported yet (or was imported with
+    # no downloadId, e.g. manually), the newest grab is the correct fallback.
+    # Doing this per-episode — instead of one shared decision for the whole
+    # batch — means one episode having (or lacking) an import record can't affect
+    # any other episode's result. An episode whose newest event has no downloadId
+    # is skipped rather than risking an older, superseded release's id.
+    target_dls: set[str] = set()
+    seen_eps: set[int] = set()
+    for ev in events:  # newest first
+        eid = _episode_id(ev)
+        if eid is None or eid not in wanted or eid in seen_eps:
+            continue
+        etype = (ev.get("eventType") or "").lower()
+        if etype not in ("downloadfolderimported", "grabbed"):
+            continue
+        seen_eps.add(eid)
+        did = H.download_id(ev)
+        if did:
+            target_dls.add(did)
+
+    if not target_dls:
+        log.info("Series %s: no matching history with a downloadId for episodes %s", series_id, sorted(wanted))
+        return 0
+
+    # One 'grabbed' record per distinct downloadId (season packs share one
+    # downloadId across many episodes — de-duplicated so it's only marked failed,
+    # and only fires one re-download, once per release).
+    targets: List[int] = []
+    seen_dls: set[str] = set()
+    for ev in events:
+        if (ev.get("eventType") or "").lower() != "grabbed":
+            continue
+        hid = ev.get("id")
+        if not isinstance(hid, int):
+            continue
+        did = H.download_id(ev)
+        if did not in target_dls or did in seen_dls:
+            continue
+        seen_dls.add(did)
+        targets.append(hid)
+        if len(seen_dls) == len(target_dls):
+            break
+
+    blocked = 0
+    for hid in targets:
+        if await H.mark_history_failed(_client_lazy(), API, HEADERS, hid, "Sonarr"):
+            blocked += 1
+    log.info("Series %s blocklist_current_releases: episodes=%s blocked=%s", series_id, episode_ids, blocked)
+    return blocked
