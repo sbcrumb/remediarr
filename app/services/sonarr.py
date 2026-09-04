@@ -1,38 +1,51 @@
-import os
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import httpx
 
 from app.services import arr_history as H
+from app.services import arr_instances as I
 
 log = logging.getLogger("remediarr")
 
-BASE = os.getenv("SONARR_URL", "").rstrip("/")
-API = f"{BASE}/api/v3"
-KEY = os.getenv("SONARR_API_KEY", "")
-HEADERS = {"X-Api-Key": KEY} if KEY else {}
-TIMEOUT = int(os.getenv("SONARR_HTTP_TIMEOUT", "60"))
+_INSTANCES = I.load_instances("SONARR")
+
+
+def _instance(instance: int = 0) -> I.ArrInstance:
+    inst = I.get_instance(_INSTANCES, instance)
+    if inst is None:
+        raise ValueError(
+            f"Sonarr instance {instance} is not configured "
+            f"(set SONARR_URL_{instance}/SONARR_API_KEY_{instance})."
+        )
+    return inst
+
 
 _client: Optional[httpx.AsyncClient] = None
 def _client_lazy() -> httpx.AsyncClient:
+    # Shared across all instances — base URL/headers are passed per-request
+    # (never baked into the client), so one client can safely serve multiple
+    # Sonarr instances. Timeout uses instance 0's; per-instance timeouts
+    # aren't supported yet (not worth the complexity until something needs it).
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=TIMEOUT)
+        _client = httpx.AsyncClient(timeout=_instance(0).timeout)
     return _client
 
-async def get_series_by_tvdb(tvdb: int) -> Optional[Dict[str, Any]]:
-    r = await _client_lazy().get(f"{API}/series", headers=HEADERS, params={"tvdbId": tvdb})
+async def get_series_by_tvdb(tvdb: int, instance: int = 0) -> Optional[Dict[str, Any]]:
+    inst = _instance(instance)
+    r = await _client_lazy().get(f"{inst.base}/series", headers=inst.headers, params={"tvdbId": tvdb})
     r.raise_for_status()
     items = r.json() or []
     return items[0] if items else None
 
-async def list_episodes(series_id: int) -> List[Dict[str, Any]]:
-    r = await _client_lazy().get(f"{API}/episode", headers=HEADERS, params={"seriesId": series_id})
+async def list_episodes(series_id: int, instance: int = 0) -> List[Dict[str, Any]]:
+    inst = _instance(instance)
+    r = await _client_lazy().get(f"{inst.base}/episode", headers=inst.headers, params={"seriesId": series_id})
     r.raise_for_status()
     return r.json() or []
 
-async def episode_ids_for(series_id: int, season: int, episode: int) -> List[int]:
-    eps = await list_episodes(series_id)
+async def episode_ids_for(series_id: int, season: int, episode: int, instance: int = 0) -> List[int]:
+    eps = await list_episodes(series_id, instance)
     ids: List[int] = []
     for e in eps:
         if e.get("seasonNumber") == season and e.get("episodeNumber") == episode:
@@ -40,8 +53,13 @@ async def episode_ids_for(series_id: int, season: int, episode: int) -> List[int
                 ids.append(e["id"])
     return ids
 
-async def delete_episodefiles(series_id: int, episode_ids: List[int]) -> int:
-    eps = await list_episodes(series_id)
+async def get_all_episode_ids_for_season(series_id: int, season: int, instance: int = 0) -> List[int]:
+    eps = await list_episodes(series_id, instance)
+    return [e["id"] for e in eps if e.get("seasonNumber") == season and isinstance(e.get("id"), int)]
+
+async def delete_episodefiles(series_id: int, episode_ids: List[int], instance: int = 0) -> int:
+    inst = _instance(instance)
+    eps = await list_episodes(series_id, instance)
     file_ids: List[int] = []
     by_id = {e["id"]: e for e in eps if "id" in e}
     for eid in episode_ids:
@@ -50,44 +68,47 @@ async def delete_episodefiles(series_id: int, episode_ids: List[int]) -> int:
             file_ids.append(efid)
     removed = 0
     for fid in file_ids:
-        dr = await _client_lazy().delete(f"{API}/episodefile/{fid}", headers=HEADERS)
+        dr = await _client_lazy().delete(f"{inst.base}/episodefile/{fid}", headers=inst.headers)
         if dr.status_code in (200, 202, 204):
             removed += 1
     log.info("Series %s delete_episodefiles: removed=%s", series_id, removed)
     return removed
 
-async def trigger_episode_search(episode_ids: List[int]) -> None:
+async def trigger_episode_search(episode_ids: List[int], instance: int = 0) -> None:
     if not episode_ids:
         return
+    inst = _instance(instance)
     body = {"name": "EpisodeSearch", "episodeIds": episode_ids}
-    r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
+    r = await _client_lazy().post(f"{inst.base}/command", headers=inst.headers, json=body)
     r.raise_for_status()
 
-async def delete_all_episodefiles_for_season(series_id: int, season: int) -> int:
-    eps = await list_episodes(series_id)
+async def delete_all_episodefiles_for_season(series_id: int, season: int, instance: int = 0) -> int:
+    inst = _instance(instance)
+    eps = await list_episodes(series_id, instance)
     file_ids = [
         e["episodeFileId"] for e in eps
         if e.get("seasonNumber") == season and e.get("episodeFileId")
     ]
     removed = 0
     for fid in file_ids:
-        dr = await _client_lazy().delete(f"{API}/episodefile/{fid}", headers=HEADERS)
+        dr = await _client_lazy().delete(f"{inst.base}/episodefile/{fid}", headers=inst.headers)
         if dr.status_code in (200, 202, 204):
             removed += 1
     log.info("Series %s season %s delete_all_episodefiles: removed=%s", series_id, season, removed)
     return removed
 
-async def trigger_season_search(series_id: int, season: int) -> None:
+async def trigger_season_search(series_id: int, season: int, instance: int = 0) -> None:
+    inst = _instance(instance)
     body = {"name": "SeasonSearch", "seriesId": series_id, "seasonNumber": season}
-    r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
+    r = await _client_lazy().post(f"{inst.base}/command", headers=inst.headers, json=body)
     r.raise_for_status()
 
-async def get_seasons_with_files(series_id: int) -> set[int]:
+async def get_seasons_with_files(series_id: int, instance: int = 0) -> set[int]:
     """Return the set of season numbers (excluding season 0/specials) that
     have at least one episode file on disk. One Sonarr fetch; callers derive
     both "how many" and "which one" from the same result instead of each
     re-fetching the episode list."""
-    eps = await list_episodes(series_id)
+    eps = await list_episodes(series_id, instance)
     seasons: set[int] = set()
     for e in eps:
         sn = e.get("seasonNumber")
@@ -106,18 +127,19 @@ def _episode_id(ev: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-async def _history_for_series(series_id: int) -> List[Dict[str, Any]]:
+async def _history_for_series(series_id: int, instance: int = 0) -> List[Dict[str, Any]]:
+    inst = _instance(instance)
     return await H.fetch_history(
-        _client_lazy(), API, HEADERS,
+        _client_lazy(), inst.base, inst.headers,
         urls=[
-            f"{API}/history/series?seriesId={series_id}",
-            f"{API}/history?seriesId={series_id}&page=1&pageSize=200&sortDirection=descending",
+            f"{inst.base}/history/series?seriesId={series_id}",
+            f"{inst.base}/history?seriesId={series_id}&page=1&pageSize=200&sortDirection=descending",
         ],
         id_field="seriesId", id_value=series_id, arr_name="Sonarr",
     )
 
 
-async def blocklist_current_releases(series_id: int, episode_ids: List[int]) -> int:
+async def blocklist_current_releases(series_id: int, episode_ids: List[int], instance: int = 0) -> int:
     """
     Blocklist the release(s) that produced the episode files currently on disk, so a
     re-search cannot grab the exact same (broken) release again.
@@ -129,7 +151,8 @@ async def blocklist_current_releases(series_id: int, episode_ids: List[int]) -> 
     """
     if not episode_ids:
         return 0
-    events = await _history_for_series(series_id)
+    inst = _instance(instance)
+    events = await _history_for_series(series_id, instance)
     if not events:
         log.info("Series %s: no history to blocklist", series_id)
         return 0
@@ -184,7 +207,7 @@ async def blocklist_current_releases(series_id: int, episode_ids: List[int]) -> 
 
     blocked = 0
     for hid in targets:
-        if await H.mark_history_failed(_client_lazy(), API, HEADERS, hid, "Sonarr"):
+        if await H.mark_history_failed(_client_lazy(), inst.base, inst.headers, hid, "Sonarr"):
             blocked += 1
     log.info("Series %s blocklist_current_releases: episodes=%s blocked=%s", series_id, episode_ids, blocked)
     return blocked
