@@ -20,13 +20,13 @@ def _payload():
 
 @pytest.fixture(autouse=True)
 def _stub_series(monkeypatch):
-    async def fake_get_series_by_tvdb(_tvdb_id):
+    async def fake_get_series_by_tvdb(_tvdb_id, instance=0):
         return SERIES
     monkeypatch.setattr(S, "get_series_by_tvdb", fake_get_series_by_tvdb)
 
 
 def _stub_episodes(monkeypatch, episodes):
-    async def fake_list_episodes(_series_id):
+    async def fake_list_episodes(_series_id, instance=0):
         return episodes
     monkeypatch.setattr(S, "list_episodes", fake_list_episodes)
 

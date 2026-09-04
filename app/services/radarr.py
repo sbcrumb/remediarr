@@ -1,34 +1,45 @@
-import os
 import logging
 from typing import Any, Dict, List, Optional
 import httpx
 
 from app.services import arr_history as H
+from app.services import arr_instances as I
 
 log = logging.getLogger("remediarr")
 
-BASE = os.getenv("RADARR_URL", "").rstrip("/")
-API = f"{BASE}/api/v3"
-KEY = os.getenv("RADARR_API_KEY", "")
-HEADERS = {"X-Api-Key": KEY} if KEY else {}
-TIMEOUT = int(os.getenv("RADARR_HTTP_TIMEOUT", "60"))
+_INSTANCES = I.load_instances("RADARR")
+
+
+def _instance(instance: int = 0) -> I.ArrInstance:
+    inst = I.get_instance(_INSTANCES, instance)
+    if inst is None:
+        raise ValueError(
+            f"Radarr instance {instance} is not configured "
+            f"(set RADARR_URL_{instance}/RADARR_API_KEY_{instance})."
+        )
+    return inst
+
 
 _client: Optional[httpx.AsyncClient] = None
 def _client_lazy() -> httpx.AsyncClient:
+    # Shared across all instances — see sonarr.py's _client_lazy for why this
+    # is safe (base URL/headers are always passed per-request).
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=TIMEOUT)
+        _client = httpx.AsyncClient(timeout=_instance(0).timeout)
     return _client
 
-async def get_movie_by_tmdb(tmdb: int) -> Optional[Dict[str, Any]]:
-    r = await _client_lazy().get(f"{API}/movie", headers=HEADERS, params={"tmdbId": tmdb})
+async def get_movie_by_tmdb(tmdb: int, instance: int = 0) -> Optional[Dict[str, Any]]:
+    inst = _instance(instance)
+    r = await _client_lazy().get(f"{inst.base}/movie", headers=inst.headers, params={"tmdbId": tmdb})
     r.raise_for_status()
     items = r.json() or []
     return items[0] if items else None
 
-async def delete_moviefiles(movie_id: int) -> int:
+async def delete_moviefiles(movie_id: int, instance: int = 0) -> int:
+    inst = _instance(instance)
     # list files
-    r = await _client_lazy().get(f"{API}/moviefile", headers=HEADERS, params={"movieId": movie_id})
+    r = await _client_lazy().get(f"{inst.base}/moviefile", headers=inst.headers, params={"movieId": movie_id})
     r.raise_for_status()
     files = r.json() or []
     removed = 0
@@ -36,29 +47,31 @@ async def delete_moviefiles(movie_id: int) -> int:
         fid = f.get("id")
         if not fid:
             continue
-        dr = await _client_lazy().delete(f"{API}/moviefile/{fid}", headers=HEADERS)
+        dr = await _client_lazy().delete(f"{inst.base}/moviefile/{fid}", headers=inst.headers)
         if dr.status_code in (200, 202, 204):
             removed += 1
     log.info("Movie %s delete_moviefiles: removed=%s", movie_id, removed)
     return removed
 
-async def trigger_search_movie(movie_id: int) -> None:
+async def trigger_search_movie(movie_id: int, instance: int = 0) -> None:
+    inst = _instance(instance)
     body = {"name": "MoviesSearch", "movieIds": [movie_id]}
-    r = await _client_lazy().post(f"{API}/command", headers=HEADERS, json=body)
+    r = await _client_lazy().post(f"{inst.base}/command", headers=inst.headers, json=body)
     r.raise_for_status()
 
-async def _history_for_movie(movie_id: int) -> List[Dict[str, Any]]:
+async def _history_for_movie(movie_id: int, instance: int = 0) -> List[Dict[str, Any]]:
+    inst = _instance(instance)
     return await H.fetch_history(
-        _client_lazy(), API, HEADERS,
+        _client_lazy(), inst.base, inst.headers,
         urls=[
-            f"{API}/history/movie?movieId={movie_id}",
-            f"{API}/history?movieId={movie_id}&page=1&pageSize=100&sortDirection=descending",
+            f"{inst.base}/history/movie?movieId={movie_id}",
+            f"{inst.base}/history?movieId={movie_id}&page=1&pageSize=100&sortDirection=descending",
         ],
         id_field="movieId", id_value=movie_id, arr_name="Radarr",
     )
 
 
-async def blocklist_current_release(movie_id: int) -> int:
+async def blocklist_current_release(movie_id: int, instance: int = 0) -> int:
     """
     Blocklist the release that produced the movie file currently on disk, so a
     re-search cannot grab the exact same (broken) release again.
@@ -67,7 +80,8 @@ async def blocklist_current_release(movie_id: int) -> int:
     'grabbed' history record as failed (what the UI's "Mark as Failed" button does),
     which blocklists that release. Returns how many releases were blocklisted.
     """
-    events = await _history_for_movie(movie_id)
+    inst = _instance(instance)
+    events = await _history_for_movie(movie_id, instance)
     if not events:
         log.info("Movie %s: no history to blocklist", movie_id)
         return 0
@@ -102,6 +116,6 @@ async def blocklist_current_release(movie_id: int) -> int:
         log.info("Movie %s: no grabbed history record for downloadId %s", movie_id, target_dl)
         return 0
 
-    blocked = 1 if await H.mark_history_failed(_client_lazy(), API, HEADERS, target_hid, "Radarr") else 0
+    blocked = 1 if await H.mark_history_failed(_client_lazy(), inst.base, inst.headers, target_hid, "Radarr") else 0
     log.info("Movie %s blocklist_current_release: blocked=%s", movie_id, blocked)
     return blocked

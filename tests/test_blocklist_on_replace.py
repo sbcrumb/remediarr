@@ -54,7 +54,7 @@ def test_sonarr_multi_episode_no_import_history_blocklists_both(monkeypatch, blo
         _grabbed(102, episode_id=2, download_id="dl-b", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(series_id):
+    async def fake_history(series_id, instance=0):
         return events
 
     monkeypatch.setattr(S, "_history_for_series", fake_history)
@@ -75,7 +75,7 @@ def test_sonarr_partial_import_coverage_still_blocklists_both(monkeypatch, block
         _grabbed(202, episode_id=2, download_id="dl-b", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(series_id):
+    async def fake_history(series_id, instance=0):
         return events
 
     monkeypatch.setattr(S, "_history_for_series", fake_history)
@@ -92,7 +92,7 @@ def test_sonarr_season_pack_shared_download_id_blocklisted_once(monkeypatch, blo
         _grabbed(301, episode_id=1, download_id="dl-pack", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(series_id):
+    async def fake_history(series_id, instance=0):
         return events
 
     monkeypatch.setattr(S, "_history_for_series", fake_history)
@@ -103,7 +103,7 @@ def test_sonarr_season_pack_shared_download_id_blocklisted_once(monkeypatch, blo
 
 
 def test_sonarr_no_matching_history_blocklists_nothing(monkeypatch, blocked):
-    async def fake_history(series_id):
+    async def fake_history(series_id, instance=0):
         return [_grabbed(401, episode_id=99, download_id="dl-x", date="2026-01-01T00:00:00Z")]
 
     monkeypatch.setattr(S, "_history_for_series", fake_history)
@@ -119,7 +119,7 @@ def test_radarr_normal_import_blocklists_it(monkeypatch, blocked):
         _grabbed_movie(501, download_id="dl-a", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(movie_id):
+    async def fake_history(movie_id, instance=0):
         return events
 
     monkeypatch.setattr(R, "_history_for_movie", fake_history)
@@ -140,7 +140,7 @@ def test_radarr_newest_import_missing_download_id_gives_up(monkeypatch, blocked)
         _grabbed_movie(601, download_id="dl-old", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(movie_id):
+    async def fake_history(movie_id, instance=0):
         return events
 
     monkeypatch.setattr(R, "_history_for_movie", fake_history)
@@ -155,7 +155,7 @@ def test_radarr_no_import_falls_back_to_newest_grab(monkeypatch, blocked):
         _grabbed_movie(701, download_id="dl-a", date="2026-01-01T00:00:00Z"),
     ]
 
-    async def fake_history(movie_id):
+    async def fake_history(movie_id, instance=0):
         return events
 
     monkeypatch.setattr(R, "_history_for_movie", fake_history)
@@ -174,21 +174,17 @@ def test_season_wide_blocklist_calls_get_all_episode_ids_for_season(monkeypatch,
     # any time a season-wide remediation ran with BLOCKLIST_ON_REPLACE=true.
     assert hasattr(S, "get_all_episode_ids_for_season")
 
-    async def fake_list_episodes(series_id):
-        return [
-            {"id": 1, "seasonNumber": 2, "episodeNumber": 1},
-            {"id": 2, "seasonNumber": 2, "episodeNumber": 2},
-            {"id": 3, "seasonNumber": 3, "episodeNumber": 1},
-        ]
+    async def fake_get_all_episode_ids_for_season(series_id, season, instance=0):
+        return [1, 2]
 
-    async def fake_history(series_id):
+    async def fake_history(series_id, instance=0):
         return []
 
-    monkeypatch.setattr(S, "list_episodes", fake_list_episodes)
+    monkeypatch.setattr(S, "get_all_episode_ids_for_season", fake_get_all_episode_ids_for_season)
     monkeypatch.setattr(S, "_history_for_series", fake_history)
 
     # Exercises the exact call handlers.py makes: get the season's episode
-    # ids, then blocklist them. Must not raise, and must only include season 2.
+    # ids, then blocklist them. Must not raise.
     episode_ids = asyncio.run(S.get_all_episode_ids_for_season(series_id=42, season=2))
     blocked_count = asyncio.run(S.blocklist_current_releases(series_id=42, episode_ids=episode_ids))
     assert episode_ids == [1, 2]
