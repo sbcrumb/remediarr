@@ -131,10 +131,10 @@ def test_handle_tv_confirm_mode_registers_and_does_not_close(mocked_io, monkeypa
     # The first half of the flow: in confirm mode a delete-bucket remediation
     # deletes + searches, posts the interim comment, registers the pending
     # entry, and must NOT close yet.
-    async def fake_delete(series_id, episode_ids):
+    async def fake_delete(series_id, episode_ids, instance=0):
         return len(episode_ids)
 
-    async def fake_search(episode_ids):
+    async def fake_search(episode_ids, instance=0):
         return None
 
     monkeypatch.setattr(handlers.S, "delete_episodefiles", fake_delete)
@@ -157,11 +157,11 @@ def mocked_tv(mocked_io, monkeypatch):
     """mocked_io plus stubbed Sonarr delete/search; records delete calls."""
     deletes = []
 
-    async def fake_delete(series_id, episode_ids):
+    async def fake_delete(series_id, episode_ids, instance=0):
         deletes.append((series_id, tuple(episode_ids)))
         return len(episode_ids)
 
-    async def fake_search(episode_ids):
+    async def fake_search(episode_ids, instance=0):
         return None
 
     monkeypatch.setattr(handlers.S, "delete_episodefiles", fake_delete)

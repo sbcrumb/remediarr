@@ -13,7 +13,7 @@ _INSTANCES = I.load_instances("RADARR")
 def _instance(instance: int = 0) -> I.ArrInstance:
     inst = I.get_instance(_INSTANCES, instance)
     if inst is None:
-        raise ValueError(
+        raise I.InstanceNotConfiguredError(
             f"Radarr instance {instance} is not configured "
             f"(set RADARR_URL_{instance}/RADARR_API_KEY_{instance})."
         )

@@ -13,7 +13,7 @@ _INSTANCES = I.load_instances("SONARR")
 def _instance(instance: int = 0) -> I.ArrInstance:
     inst = I.get_instance(_INSTANCES, instance)
     if inst is None:
-        raise ValueError(
+        raise I.InstanceNotConfiguredError(
             f"Sonarr instance {instance} is not configured "
             f"(set SONARR_URL_{instance}/SONARR_API_KEY_{instance})."
         )
