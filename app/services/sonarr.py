@@ -20,6 +20,13 @@ def _instance(instance: int = 0) -> I.ArrInstance:
     return inst
 
 
+def instances() -> Dict[int, I.ArrInstance]:
+    """All configured Sonarr instances, keyed by index. Public accessor for
+    callers outside this module (e.g. health checks) that need to iterate
+    every configured instance rather than resolve a single one."""
+    return _INSTANCES
+
+
 _client: Optional[httpx.AsyncClient] = None
 def _client_lazy() -> httpx.AsyncClient:
     # Shared across all instances — base URL/headers are passed per-request
