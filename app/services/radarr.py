@@ -20,6 +20,13 @@ def _instance(instance: int = 0) -> I.ArrInstance:
     return inst
 
 
+def instances() -> Dict[int, I.ArrInstance]:
+    """All configured Radarr instances, keyed by index. Public accessor for
+    callers outside this module (e.g. health checks) that need to iterate
+    every configured instance rather than resolve a single one."""
+    return _INSTANCES
+
+
 _client: Optional[httpx.AsyncClient] = None
 def _client_lazy() -> httpx.AsyncClient:
     # Shared across all instances — see sonarr.py's _client_lazy for why this
