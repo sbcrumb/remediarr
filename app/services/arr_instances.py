@@ -29,6 +29,14 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 
+class InstanceNotConfiguredError(ValueError):
+    """Raised when a Sonarr/Radarr instance index (typically resolved from
+    Seerr's media.serviceId/serviceId4k) has no matching *_URL_<N>/*_API_KEY_<N>
+    configured on this remediarr install. Callers should comment on the Seerr
+    issue explaining the instance is unconfigured, but leave it open rather
+    than closing it — this is an admin config gap, not a "nothing to do" case."""
+
+
 @dataclass(frozen=True)
 class ArrInstance:
     index: int
