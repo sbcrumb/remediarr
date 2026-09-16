@@ -343,7 +343,11 @@ Please update `.env.example` if you add new configuration options.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPLv3) - see the [LICENSE](LICENSE) file for details.
+
+Copyright (C) 2025-2026 SBCrumb and contributors.
+
+AGPLv3 keeps the same permissions as before (use, modify, self-host, even sell) — it just requires that anyone who distributes a modified version, or runs it as a network service, also makes their modified source available. Previously released versions remain available under the MIT terms they were originally published under; this change applies going forward. See [#90](https://github.com/sbcrumb/remediarr/issues/90) for the relicensing discussion.
 
 ## Support
 
