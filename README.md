@@ -139,6 +139,19 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `SEERR_URL` | Jellyseerr/Seerr base URL (legacy `JELLYSEERR_URL` still works) | `http://seerr:5055` |
 | `SEERR_API_KEY` | Jellyseerr/Seerr API key (legacy `JELLYSEERR_API_KEY` still works) | `ghi789...` |
 
+### Multiple Sonarr/Radarr Instances (🚧 work in progress, `v3` branch — not yet released)
+
+Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "strm"/rclone-mounted library, a 4K instance, or any other reason to run more than one. If your media is split across multiple instances, add them here (numbered starting at 1 — `SONARR_URL`/`RADARR_URL` above are always instance 0):
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SONARR_URL_1`, `SONARR_API_KEY_1`, `SONARR_HTTP_TIMEOUT_1` | A second Sonarr instance. Add `_2`, `_3`, etc. for more. | `http://sonarr-strm:8989` |
+| `RADARR_URL_1`, `RADARR_API_KEY_1`, `RADARR_HTTP_TIMEOUT_1` | A second Radarr instance. Add `_2`, `_3`, etc. for more. | `http://radarr-strm:7878` |
+
+**Important — the numbering must match the order the instances were added in Seerr's own Settings → Services.** Seerr's issue API tells Remediarr which instance a report's media belongs to by index (`0`, `1`, `2`, …) in that same order — there's no other stable way to identify which instance is which. If you reorder, add, or remove an instance in Seerr later, update the numbering here to match, or Remediarr will route to the wrong Sonarr/Radarr.
+
+**Current status:** as of this branch, the config above is parsed and validated, but the actual routing logic (reading which instance a given issue's media belongs to and directing the fix there) isn't wired up yet — setting these variables doesn't do anything yet. Single-instance setups (just `SONARR_URL`/`RADARR_URL`, no `_1`/`_2` suffix) are completely unaffected and behave exactly as before. This section will be updated once routing lands and the feature is actually usable.
+
 ### Optional Settings
 
 | Variable | Description | Example |
