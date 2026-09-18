@@ -9,6 +9,7 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 ## Features
 
 - **🔌 Jellyseerr & Seerr Support**: Both are supported out of the box — they share the same API (`SEERR_URL`/`SEERR_API_KEY`)
+- **🔀 Multi-Instance Routing**: Point Seerr at more than one Sonarr/Radarr (a separate "strm" library, a 4K instance, etc.) and Remediarr routes each fix to the right one automatically — no per-request setup, just configure the instances once
 - **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
 - **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
@@ -33,6 +34,8 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 > **Type-driven mode (opt-in):** set `ISSUE_TYPE_AS_BUCKET=true` and step 3 uses the issue **Type** (Audio/Video/Subtitle/Other) instead of comment keywords — the comment is ignored. Audio/Video/Subtitle delete + re-search; Other searches only.
 
 > **Confirm-on-import (opt-in):** set `CONFIRM_REPLACEMENT_IMPORT=true` and steps 6–7 are deferred — Remediarr posts an interim comment and closes only when Sonarr's On-Import webhook confirms the new file actually landed on disk (see the [setup note](#optional-settings) below).
+
+> **Multi-instance (automatic, if configured):** step 4 checks the *specific* Sonarr/Radarr instance Seerr reports the media as living on, not always the default — see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances) below. Nothing to do per-request; this runs on every issue once the instances are configured.
 
 ## Quick Start
 
@@ -151,6 +154,10 @@ Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "
 **Important — the numbering must match the order the instances were added in Seerr's own Settings → Services.** Seerr's issue API tells Remediarr which instance a report's media belongs to by index (`0`, `1`, `2`, …) in that same order — there's no other stable way to identify which instance is which. If you reorder, add, or remove an instance in Seerr later, update the numbering here to match, or Remediarr will route to the wrong Sonarr/Radarr.
 
 **If Remediarr sees an instance index it has no config for** (e.g. a 3rd instance was added in Seerr but `SONARR_URL_2`/`RADARR_URL_2` was never added here), it doesn't silently default to instance 0 — it comments on the issue explaining which instance is unconfigured and what env vars to add, and leaves the issue open rather than guessing. Single-instance setups (just `SONARR_URL`/`RADARR_URL`, no `_1`/`_2` suffix) are completely unaffected and behave exactly as before.
+
+**Finding your index numbers:** open Seerr's **Settings → Services** and count from the top, starting at 0, separately for Sonarr and Radarr — the order they're listed there is the order Seerr reports them in, and the only order that matters. There's nothing to check on the Remediarr side beyond making sure your `_1`/`_2` env vars match that same order.
+
+**Day-to-day, there's nothing extra to do.** Once the instances are configured, routing is automatic on every issue — users report problems exactly the same way regardless of which instance their media lives on. `GET /health/detailed` also checks every configured instance, not just the default, so a misconfigured second instance shows up there before it shows up as a routing failure.
 
 ### Optional Settings
 
@@ -285,7 +292,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 
 - `GET /` - Basic status and version info
 - `GET /health` - Simple health check  
-- `GET /health/detailed` - Health check including external services
+- `GET /health/detailed` - Health check including external services — every configured Sonarr/Radarr instance, not just the default
 - `POST /webhook/jellyseerr` - Main webhook endpoint (this path name is unchanged for backward compat, but it's the correct endpoint for Seerr too — Jellyseerr and Seerr send the same payload)
 - `POST /webhook/sonarr` - Sonarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
 - `POST /webhook/radarr` - Radarr "On Import" webhook (used only when `CONFIRM_REPLACEMENT_IMPORT=true`)
@@ -311,6 +318,11 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 **Files not found in Sonarr/Radarr**
 - Verify the content exists in your *arr apps
 - Check that TVDB/TMDB IDs match between Jellyseerr/Seerr and your *arr apps
+- If you run multiple instances, confirm the content actually lives on the instance Seerr thinks it does (see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances))
+
+**Issue left open with a comment about an unconfigured instance**
+- Seerr reports an instance index Remediarr has no `SONARR_URL_N`/`RADARR_URL_N` for — add it, matching the order instances appear in Seerr's **Settings → Services**
+- This is deliberate, fail-loud behavior, not a bug — Remediarr won't guess and silently check the wrong instance
 
 ### Debug Mode
 ```bash
@@ -339,18 +351,18 @@ docker run --rm -p 8189:8189 --env-file .env remediarr:dev
 ## Container Images
 
 - **Latest stable**: `ghcr.io/sbcrumb/remediarr:latest`
-- **Version tagged**: `ghcr.io/sbcrumb/remediarr:v1.0.0`  
+- **Version tagged**: `ghcr.io/sbcrumb/remediarr:0.2.6` (matches the current `VERSION` file — check [releases](https://github.com/sbcrumb/remediarr/releases) for the latest)
 - **Development**: `ghcr.io/sbcrumb/remediarr:dev`
 
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
+2. Create a feature branch off `dev`: `git checkout -b feature-name dev`
 3. Make your changes
 4. Add tests if applicable
 5. Commit: `git commit -m 'Add feature'`
 6. Push: `git push origin feature-name`  
-7. Open a Pull Request
+7. Open a Pull Request **against `dev`**, not `main` — `main` only receives promotions from `dev`
 
 Please update `.env.example` if you add new configuration options.
 
