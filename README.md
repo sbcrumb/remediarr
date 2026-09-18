@@ -11,7 +11,7 @@ Remediarr is a lightweight webhook service that automatically fixes common media
 - **🔌 Jellyseerr & Seerr Support**: Both are supported out of the box — they share the same API (`SEERR_URL`/`SEERR_API_KEY`)
 - **🔀 Multi-Instance Routing**: Point Seerr at more than one Sonarr/Radarr (a separate "strm" library, a 4K instance, etc.) and Remediarr routes each fix to the right one automatically — no per-request setup, just configure the instances once
 - **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
-- **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection  
+- **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection, plus wrong-episode/wrong-show downloads  
 - **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
 - **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr/Seerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
 - **✅ Confirm-on-Import** *(opt-in)*: Hold the issue open until Sonarr confirms the replacement imported — it closes only when the file is actually on disk (`CONFIRM_REPLACEMENT_IMPORT`)
@@ -212,6 +212,7 @@ TV_AUDIO_KEYWORDS="no audio,no sound,missing audio,audio issue,wrong language"
 TV_VIDEO_KEYWORDS="no video,video glitch,black screen,stutter,pixelation"  
 TV_SUBTITLE_KEYWORDS="missing subs,no subtitles,bad subtitles,wrong subs"
 TV_OTHER_KEYWORDS="buffering,playback error,corrupt file"
+TV_WRONG_KEYWORDS="wrong episode,incorrect episode,wrong show,incorrect show"
 
 # Movie Keywords  
 MOVIE_AUDIO_KEYWORDS="no audio,no sound,audio issue,wrong language"
@@ -238,6 +239,7 @@ WEBHOOK_HEADER_VALUE="your-auth-token"
 - **Audio Issues**: "no audio", "missing audio", "wrong language" → Deletes episode file, triggers re-download
 - **Video Issues**: "no video", "black screen", "pixelation" → Deletes episode file, triggers re-download  
 - **Subtitle Issues**: "no subtitles", "subs out of sync" → **Uses Bazarr** (if configured) to search for subtitles, otherwise deletes episode file and triggers re-download
+- **Wrong Episode/Show**: "wrong episode", "wrong show", "incorrect episode" → Deletes episode file(s), triggers re-download
 - **Other Issues**: "buffering", "corrupt file" → Deletes episode file, triggers re-download
 
 ### Movies
