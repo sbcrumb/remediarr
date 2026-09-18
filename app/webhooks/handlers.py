@@ -72,6 +72,7 @@ TV_AUDIO = set(_csv("TV_AUDIO_KEYWORDS") or ["no audio", "no sound", "missing au
 TV_VIDEO = set(_csv("TV_VIDEO_KEYWORDS") or ["no video", "video glitch", "black screen", "stutter", "pixelation"])
 TV_SUBS = set(_csv("TV_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
 TV_OTHER = set(_csv("TV_OTHER_KEYWORDS") or ["buffering", "playback error", "corrupt file"])
+TV_WRONG = set(_csv("TV_WRONG_KEYWORDS") or ["not the right show", "wrong show", "incorrect show", "wrong episode", "incorrect episode", "not the right episode"])
 MOV_AUDIO = set(_csv("MOVIE_AUDIO_KEYWORDS") or ["no audio", "no sound", "audio issue"])
 MOV_VIDEO = set(_csv("MOVIE_VIDEO_KEYWORDS") or ["no video", "video missing", "bad video", "broken video", "black screen"])
 MOV_SUBS = set(_csv("MOVIE_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
@@ -82,13 +83,20 @@ def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-    
-    # Check for wrong movie first (movie-specific)
+
+    # Check for "wrong" first (movie or show/episode) - same reasoning as the
+    # TV_SUBS/MOV_SUBS "wrong subs" phrase below: checking wrong before the
+    # other buckets keeps "wrong episode" from being caught by some other
+    # bucket's substring first.
     if media_type == "movie":
         for keyword in MOV_WRONG:
             if keyword in t:
                 return "wrong"
-    
+    elif media_type in ("tv", "series"):
+        for keyword in TV_WRONG:
+            if keyword in t:
+                return "wrong"
+
     # Check other buckets using substring matching
     for keyword in (MOV_AUDIO | TV_AUDIO):
         if keyword in t:
@@ -678,7 +686,7 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
         log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
         return
 
-    if bucket in ("audio", "video", "subtitle"):
+    if bucket in ("audio", "video", "subtitle", "wrong"):
         # Blocklist all reported episodes in ONE pass before deleting: episodes from
         # the same season pack share a downloadId, and marking that grab failed twice
         # would double-blocklist it and fire a second redownload.
@@ -722,7 +730,7 @@ async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, 
                 return
         log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
 
-    if bucket in ("audio", "video", "subtitle"):
+    if bucket in ("audio", "video", "subtitle", "wrong"):
         all_ids = await S.get_all_episode_ids_for_season(series_id, season, instance=instance)
         await _blocklist_episodes(series_id, all_ids, instance=instance)
         removed = await S.delete_all_episodefiles_for_season(series_id, season, instance=instance)
@@ -766,7 +774,7 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     # and it falls through to the normal comment+close below. NB Bazarr-handled
     # subtitle fixes return early above and always close at action time (a Bazarr
     # search produces no Sonarr import to wait for).
-    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle")
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle", "wrong")
     already_pending = confirm and (series_id, season, episode) in _PENDING_IMPORTS
 
     # Delete + re-search — unless a remediation for this exact episode is already in
@@ -774,7 +782,7 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     # just attach this issue to the existing pending entry below.
     if not already_pending:
         removed = 0
-        if bucket in ("audio", "video", "subtitle"):
+        if bucket in ("audio", "video", "subtitle", "wrong"):
             await _blocklist_episodes(series_id, episode_ids, instance=instance)
             log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
             removed = await S.delete_episodefiles(series_id, episode_ids, instance=instance)
@@ -995,7 +1003,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
                     keywords = list(TV_OTHER)[:5]
                 else:
                     # If issue type unknown, show a mix but prioritize common ones
-                    keywords = list(TV_VIDEO)[:2] + list(TV_AUDIO)[:2] + list(TV_SUBS)[:2]
+                    keywords = list(TV_VIDEO)[:2] + list(TV_AUDIO)[:2] + list(TV_WRONG)[:2]
             else:
                 keywords = ["specific issue keywords"]
             
