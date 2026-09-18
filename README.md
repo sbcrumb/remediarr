@@ -139,7 +139,7 @@ Remediarr is configured entirely through environment variables. See the [complet
 | `SEERR_URL` | Jellyseerr/Seerr base URL (legacy `JELLYSEERR_URL` still works) | `http://seerr:5055` |
 | `SEERR_API_KEY` | Jellyseerr/Seerr API key (legacy `JELLYSEERR_API_KEY` still works) | `ghi789...` |
 
-### Multiple Sonarr/Radarr Instances (🚧 work in progress, `v3` branch — not yet released)
+### Multiple Sonarr/Radarr Instances
 
 Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "strm"/rclone-mounted library, a 4K instance, or any other reason to run more than one. If your media is split across multiple instances, add them here (numbered starting at 1 — `SONARR_URL`/`RADARR_URL` above are always instance 0):
 
@@ -150,7 +150,7 @@ Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "
 
 **Important — the numbering must match the order the instances were added in Seerr's own Settings → Services.** Seerr's issue API tells Remediarr which instance a report's media belongs to by index (`0`, `1`, `2`, …) in that same order — there's no other stable way to identify which instance is which. If you reorder, add, or remove an instance in Seerr later, update the numbering here to match, or Remediarr will route to the wrong Sonarr/Radarr.
 
-**Current status:** as of this branch, the config above is parsed and validated, but the actual routing logic (reading which instance a given issue's media belongs to and directing the fix there) isn't wired up yet — setting these variables doesn't do anything yet. Single-instance setups (just `SONARR_URL`/`RADARR_URL`, no `_1`/`_2` suffix) are completely unaffected and behave exactly as before. This section will be updated once routing lands and the feature is actually usable.
+**If Remediarr sees an instance index it has no config for** (e.g. a 3rd instance was added in Seerr but `SONARR_URL_2`/`RADARR_URL_2` was never added here), it doesn't silently default to instance 0 — it comments on the issue explaining which instance is unconfigured and what env vars to add, and leaves the issue open rather than guessing. Single-instance setups (just `SONARR_URL`/`RADARR_URL`, no `_1`/`_2` suffix) are completely unaffected and behave exactly as before.
 
 ### Optional Settings
 
