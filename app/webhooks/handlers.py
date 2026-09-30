@@ -30,24 +30,78 @@ class AllSeasonsAmbiguousError(ValueError):
         super().__init__(f"All Seasons selected for '{title}' ({reason}).")
 
 
+def _as_instance_index(val: Any) -> Optional[int]:
+    """Parse a Seerr serviceId-shaped value (int, numeric string, or null/bool
+    junk) into an instance index, or None if it isn't a usable index."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val.strip())
+    return None
+
+
 def _resolve_instance(media: Dict[str, Any]) -> int:
     """Which configured Sonarr/Radarr instance owns this media, per Seerr's
     own multi-instance indexing. Seerr reports this as media.serviceId (or
     serviceId4k for a 4K request) — a 0-based index into however many
     Sonarr/Radarr instances are configured on the Seerr side, in the order
-    they were added there. serviceId wins when both are present (we don't
-    currently distinguish 4K requests); default to instance 0 when Seerr
-    reports neither, which matches pre-v3 single-instance behavior exactly."""
+    they were added there. Only used when serviceId/serviceId4k aren't BOTH
+    present — see _resolve_instance_for_action for that ambiguous case, which
+    is real and confirmed (a title available on both a standard and 4K
+    instance reports both fields on the very same issue). Default to instance
+    0 when Seerr reports neither, matching pre-v3 single-instance behavior."""
     media = media or {}
-    for key in ("serviceId", "serviceId4k"):
-        val = media.get(key)
-        if isinstance(val, bool):
-            continue
-        if isinstance(val, int):
-            return val
-        if isinstance(val, str) and val.strip().isdigit():
-            return int(val.strip())
+    sid = _as_instance_index((media or {}).get("serviceId"))
+    if sid is not None:
+        return sid
+    sid4k = _as_instance_index((media or {}).get("serviceId4k"))
+    if sid4k is not None:
+        return sid4k
     return 0
+
+
+# Explicit quality signal a reporter can give in a comment when a title exists
+# on both a standard and 4K instance and Seerr's issue data alone can't say
+# which one a report concerns (confirmed against real data: the issue payload
+# carries nothing 4K-specific at all — see PROJECT.md's v3 notes).
+QUALITY_4K_KEYWORDS_ENV = "QUALITY_4K_KEYWORDS"
+QUALITY_STANDARD_KEYWORDS_ENV = "QUALITY_STANDARD_KEYWORDS"
+
+
+def _quality_hint_from_text(text: str) -> Optional[str]:
+    """Scan free text (typically the reporter's own comment) for an explicit
+    quality signal. Returns "4k", "standard", or None if neither is present."""
+    if not text:
+        return None
+    t = text.lower()
+    if any(kw in t for kw in QUALITY_4K_KEYWORDS):
+        return "4k"
+    if any(kw in t for kw in QUALITY_STANDARD_KEYWORDS):
+        return "standard"
+    return None
+
+
+def _resolve_instance_for_action(media: Dict[str, Any], reporter_text: str) -> Tuple[Optional[int], bool]:
+    """Resolve the instance to actually act on, handling the ambiguous
+    both-serviceId-and-serviceId4k case explicitly instead of silently
+    guessing. Returns (instance, needs_clarification):
+      - needs_clarification=True means we genuinely can't tell which library
+        this report is about and instance is meaningless (None) — the caller
+        should ask the reporter rather than act.
+      - Otherwise instance is the index to use, resolved either from an
+        explicit quality keyword in reporter_text or (when unambiguous)
+        the normal single-value fallback in _resolve_instance."""
+    media = media or {}
+    sid = _as_instance_index(media.get("serviceId"))
+    sid4k = _as_instance_index(media.get("serviceId4k"))
+    if sid is not None and sid4k is not None and sid != sid4k:
+        hint = _quality_hint_from_text(reporter_text)
+        if hint is None:
+            return None, True
+        return (sid4k if hint == "4k" else sid), False
+    return _resolve_instance(media), False
 
 
 # env/config
@@ -78,6 +132,10 @@ MOV_VIDEO = set(_csv("MOVIE_VIDEO_KEYWORDS") or ["no video", "video missing", "b
 MOV_SUBS = set(_csv("MOVIE_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
 MOV_OTHER = set(_csv("MOVIE_OTHER_KEYWORDS") or ["buffering", "playback error", "corrupt file"])
 MOV_WRONG = set(_csv("MOVIE_WRONG_KEYWORDS") or ["not the right movie", "wrong movie", "incorrect movie"])
+QUALITY_4K_KEYWORDS = set(_csv(QUALITY_4K_KEYWORDS_ENV) or ["4k", "4 k", "uhd", "2160p"])
+QUALITY_STANDARD_KEYWORDS = set(_csv(QUALITY_STANDARD_KEYWORDS_ENV) or [
+    "1080p", "1080", "standard", "regular", "non-4k", "non 4k", "sd version", "normal quality",
+])
 
 def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     if not text:
@@ -296,6 +354,16 @@ def _is_all_episodes(value: Any) -> bool:
 # import webhook to also identify which instance sent it, which Sonarr/Radarr
 # don't provide directly. Revisit if it ever actually bites someone.
 _PENDING_IMPORTS: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+
+# Multi-instance 4K ambiguity: issues waiting on the reporter to say which
+# library ("4k" or "standard") their report is about, keyed by issue_id ->
+# {"bucket": str, "title": str}. Needed because in keyword-scan mode
+# (ISSUE_TYPE_AS_BUCKET=false) the reply itself ("4k") won't match any bucket
+# keyword on its own — the bucket we already determined when we first asked
+# has to be remembered so the reply resumes the original fix instead of
+# dead-ending as "no actionable keywords". In-memory/best-effort like
+# _PENDING_IMPORTS: cleared on restart, issue simply stays open (fail-safe).
+_PENDING_INSTANCE_CLARIFICATION: Dict[int, Dict[str, Any]] = {}
 
 def _register_pending_import(series_id: int, season: int, episode: int,
                              issue_id: int, title: str) -> bool:
@@ -937,9 +1005,8 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     media_type = (media.get("mediaType") or media.get("type") or "").lower()
     tmdb = media.get("tmdbId")
     tvdb = media.get("tvdbId")
-    instance = _resolve_instance(media)
 
-    log.info("Issue context: media_type=%s, tmdb=%s, tvdb=%s, instance=%s", media_type, tmdb, tvdb, instance)
+    log.info("Issue context: media_type=%s, tmdb=%s, tvdb=%s", media_type, tmdb, tvdb)
 
     # Last human comment & bucket
     last = await jelly_last_human_comment(issue_id)
@@ -964,6 +1031,14 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         bucket = _bucket_for(last, media_type)
         log.info("Keyword scan: %r -> bucket=%s", last, bucket)
+
+    # A reply that's only a quality clarification ("4k"/"standard") won't match
+    # any bucket keyword on its own in keyword-scan mode — reuse the bucket we
+    # remembered from when we originally asked, so the reply resumes the fix
+    # instead of dead-ending as "no actionable keywords".
+    if not bucket and issue_id in _PENDING_INSTANCE_CLARIFICATION and _quality_hint_from_text(last):
+        bucket = _PENDING_INSTANCE_CLARIFICATION[issue_id]["bucket"]
+        log.info("Issue %s: clarification reply resolves to remembered bucket=%s", issue_id, bucket)
 
     # No bucket → coach the user if coaching is enabled
     if not bucket:
@@ -1017,6 +1092,34 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             await jelly_comment(issue_id, coach_msg)
         
         return {"ok": True, "detail": "ignored: no actionable keywords"}
+
+    # Multi-instance 4K ambiguity: confirmed against real Seerr data that a
+    # title available on both a standard and 4K instance reports BOTH
+    # serviceId and serviceId4k on the very same issue, with nothing on the
+    # issue itself saying which version the report concerns — Seerr attaches
+    # issues to the title, not to a specific quality tier. Rather than guess
+    # (and risk "fixing" a copy that was never broken while the real one stays
+    # broken), look for an explicit quality keyword in the reporter's own
+    # comment; if it's not there, ask instead of acting.
+    instance, needs_clarification = _resolve_instance_for_action(media, last)
+    if needs_clarification:
+        sid = media.get("serviceId")
+        sid4k = media.get("serviceId4k")
+        title_hint = media.get("title") or media.get("name") or "this title"
+        _PENDING_INSTANCE_CLARIFICATION[issue_id] = {"bucket": bucket, "title": title_hint}
+        log.info("Issue %s: ambiguous instance (serviceId=%s serviceId4k=%s) — asking reporter to clarify",
+                 issue_id, sid, sid4k)
+        if COMMENT_ON_ACTION:
+            msg = (
+                f"{PREFIX} {title_hint} is available on both a standard and a 4K library here, and I "
+                f"can't tell which one this report is about. Reply with \"4k\" or \"standard\" and I'll "
+                f"pick this up from there."
+            )
+            await jelly_comment(issue_id, msg)
+        return {"ok": True, "detail": "ignored: ambiguous instance (4k vs standard), awaiting clarification"}
+
+    # Resolved (possibly via a clarification reply) — clear any pending entry.
+    _PENDING_INSTANCE_CLARIFICATION.pop(issue_id, None)
 
     # Cooldown guard
     if _under_cooldown(issue_id):
