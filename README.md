@@ -4,22 +4,18 @@
 
 > ⚠️ **Work in Progress**: Remediarr is under active development. Configuration options, API endpoints, and behavior may change between versions. Please check the changelog and update your configuration when upgrading. Feedback and bug reports are welcome!
 
-Remediarr is a lightweight webhook service that automatically fixes common media issues reported through Jellyseerr or Seerr (they share the same API, so both are supported). When users report problems like "no audio" or "wrong movie", Remediarr detects the keywords, deletes problematic files, triggers new downloads, and closes the issue—all without manual intervention.
+Remediarr is a webhook service that automatically fixes common media issues reported through Jellyseerr or Seerr (they share the same API, so both are supported). When users report problems like "no audio" or "wrong movie", Remediarr detects the keywords, deletes problematic files, triggers new downloads, and closes the issue—all without manual intervention.
 
 ## Features
 
-- **🔌 Jellyseerr & Seerr Support**: Both are supported out of the box — they share the same API (`SEERR_URL`/`SEERR_API_KEY`)
-- **🔀 Multi-Instance Routing**: Point Seerr at more than one Sonarr/Radarr (a separate "strm" library, a 4K instance, etc.) and Remediarr routes each fix to the right one automatically — no per-request setup, just configure the instances once
-- **🎬 Movie Automation**: Handles audio, video, subtitle issues, and wrong movie downloads
-- **📺 TV Show Automation**: Manages episode-specific problems with season/episode detection, plus wrong-episode/wrong-show downloads  
-- **🤖 Smart Keyword Detection**: Recognizes issue types from user comments
-- **🏷️ Type-Driven Mode** *(opt-in)*: Let the Jellyseerr/Seerr issue **Type** pick the action — no keywords needed (`ISSUE_TYPE_AS_BUCKET`)
-- **✅ Confirm-on-Import** *(opt-in)*: Hold the issue open until Sonarr confirms the replacement imported — it closes only when the file is actually on disk (`CONFIRM_REPLACEMENT_IMPORT`)
-- **💬 User Coaching**: Suggests correct keywords when users don't use recognizable terms
-- **🔄 Loop Prevention**: Avoids processing its own comments and resolved issues
-- **📱 Notifications**: Optional Gotify and Apprise integration
-- **🔐 Security**: HMAC signature verification and custom header authentication
-- **⚡ Performance**: Built with FastAPI for speed and reliability
+- Jellyseerr and Seerr both work out of the box — same API, so `SEERR_URL`/`SEERR_API_KEY` covers either one.
+- Point Seerr at more than one Sonarr/Radarr (a separate strm library, a 4K instance, etc.) and Remediarr routes each fix to the right one automatically once the instances are configured.
+- Handles audio, video, subtitle, and wrong-movie/wrong-episode issues for both movies and TV, with season/episode detection.
+- Recognizes issue types from the comment text, or — if you turn on `ISSUE_TYPE_AS_BUCKET` — just uses the Jellyseerr/Seerr issue **Type** and skips keyword matching entirely.
+- Can hold an issue open until Sonarr actually confirms the replacement imported (`CONFIRM_REPLACEMENT_IMPORT`) instead of closing optimistically.
+- Suggests the right keywords when a user's comment doesn't match anything.
+- Won't process its own comments or already-resolved issues.
+- Optional Gotify/Apprise notifications, HMAC or header-based webhook auth, built on FastAPI.
 
 ## How It Works
 
@@ -167,9 +163,14 @@ Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "
 |----------|-------------|---------|
 | `BAZARR_URL` | Bazarr base URL (for subtitle management) | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key | `jkl012...` |
+| `BAZARR_SUBTITLE_LANGUAGES` | Comma-separated ISO 639-1 language codes controlling which subtitle language(s) Bazarr searches for. | `en` |
+| `BAZARR_FORCE_REDOWNLOAD` | When `true`, deletes existing subtitles before searching so a bad/out-of-sync subtitle gets replaced instead of left in place. Default `false` (only searches when subtitles are missing). | `false` |
 | `ISSUE_TYPE_AS_BUCKET` | When `true`, the Jellyseerr/Seerr issue **Type** (Audio/Video/Subtitle/Other) drives the action and the **comment is ignored** — users can report an issue by type alone with no keywords required. Audio/Video/Subtitle → delete + re-search; Other → search only. The `*_KEYWORDS` lists are unused while this is on. Default `false`. | `false` |
 | `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds an issue open after triggering a re-download and only comments + closes once the replacement is confirmed imported. TV issues wait for Sonarr's On Import webhook; movie issues wait for Radarr's. If the download never lands, the issue stays open as a signal for manual follow-up. Requires the webhook setup below for each arr you want to confirm. Default `false`. | `false` |
 | `BLOCKLIST_ON_REPLACE` | When `true`, Remediarr marks the grab that produced the bad file as **failed** in Radarr/Sonarr before deleting it, which adds that release to the arr's **Blocklist**. The re-search then skips it instead of potentially grabbing the same broken release again. Blocklisting matches an exact release, not the content — a different upload of the same bad encode can still return. Entries stay until removed in *Activity → Blocklist*. Default `false`. | `false` |
+| `REMEDIARR_ISSUE_COOLDOWN_SEC` | Minimum seconds between remediation attempts on the same issue — protects against webhook loops/spam re-triggering the same fix. Default `90`. | `90` |
+| `STARTUP_HEALTH_CHECK_RETRIES` | How many times to retry each Sonarr/Radarr/Bazarr health check at startup before giving up. Default `3`. | `3` |
+| `STARTUP_HEALTH_CHECK_DELAY` | Seconds to wait between startup health check retries. Default `10`. | `10` |
 
 > **Running multiple Sonarr/Radarr instances?** (see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances)) Set this webhook up on **every** instance, not just the default one — they all point at the exact same Remediarr URL below. Remediarr matches a confirmation by the movie/episode id, not by which instance sent it, so it doesn't matter which instance's webhook fires — only that each one has it configured at all. A file remediated on an instance with no webhook configured will never auto-close; see [Issues not auto-closing / stuck open](#common-issues) below.
 
@@ -246,33 +247,11 @@ WEBHOOK_HEADER_VALUE="your-auth-token"
 
 ## Supported Issue Types
 
-### TV Shows
-- **Audio Issues**: "no audio", "missing audio", "wrong language" → Deletes episode file, triggers re-download
-- **Video Issues**: "no video", "black screen", "pixelation" → Deletes episode file, triggers re-download  
-- **Subtitle Issues**: "no subtitles", "subs out of sync" → **Uses Bazarr** (if configured) to search for subtitles, otherwise deletes episode file and triggers re-download
-- **Wrong Episode/Show**: "wrong episode", "wrong show", "incorrect episode" → Deletes episode file(s), triggers re-download
-- **Other Issues**: "buffering", "corrupt file" → Deletes episode file, triggers re-download
-
-### Movies
-- **Audio/Video Issues**: Same behavior as TV shows
-- **Subtitle Issues**: **Uses Bazarr** (if configured) to search for subtitles, otherwise deletes movie files and triggers new search
-- **Wrong Movie**: "wrong movie", "incorrect movie" → Deletes all movie files, triggers new search
-- **Other Issues**: "buffering", "corrupt file" → Deletes movie files, triggers new search
+Audio, video, and subtitle problems trigger a delete + re-download — for both movies and TV, and subtitles go through Bazarr instead if it's configured (see below). Wrong movie/episode reports do the same. Anything else ("buffering", "corrupt file," whatever `*_OTHER_KEYWORDS` covers) triggers a new search only, no deletion. Exact keywords are customizable — see [Keyword Customization](#keyword-customization) for the real lists.
 
 ## Bazarr Integration
 
-When Bazarr is configured (`BAZARR_URL` and `BAZARR_API_KEY` set), subtitle issues are handled more intelligently:
-
-### Enhanced Subtitle Handling
-- **Movies**: Searches for new subtitles via Bazarr, deletes existing poor subtitles first
-- **TV Shows**: Triggers subtitle search for the specific episode via Bazarr 
-- **Fallback**: If Bazarr is unavailable or fails, falls back to traditional file deletion and re-download
-
-### Benefits of Bazarr Integration
-- **Faster resolution**: Only downloads subtitles, not entire media files
-- **Provider diversity**: Leverages Bazarr's multiple subtitle providers
-- **Language support**: Respects Bazarr's configured languages and preferences
-- **Bandwidth efficient**: Avoids unnecessary media re-downloads for subtitle-only issues
+When Bazarr is configured (`BAZARR_URL` and `BAZARR_API_KEY` set), subtitle issues go through Bazarr instead of a full re-download — for movies it deletes the existing (bad) subtitle first, for TV it triggers a search for that episode. If Bazarr's down or the search fails, it falls back to the normal delete-and-redownload path.
 
 ## User Coaching
 
@@ -298,7 +277,9 @@ GOTIFY_PRIORITY=5
 
 ### Apprise (Discord, Slack, Telegram, etc.)
 ```bash
-APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
+# Multiple URLs separated by semicolons (not commas — some Apprise URLs
+# use commas in their own query parameters, e.g. "?format=markdown,text")
+APPRISE_URLS="discord://webhook_id/webhook_token;slack://hook_url"
 ```
 
 ## API Endpoints
@@ -341,6 +322,7 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 - The title exists on both a standard and 4K instance and the report doesn't say which one is broken — see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances) above
 - Reply on the issue with `4k` or `standard` (or a word from `QUALITY_4K_KEYWORDS`/`QUALITY_STANDARD_KEYWORDS`) and Remediarr picks up the fix from there
 - Also deliberate, not a bug — same reasoning as the unconfigured-instance case above: Remediarr won't guess which copy to touch
+- If `SEERR_COMMENT_ON_ACTION=false`, Remediarr still won't guess, but it also won't post the clarifying question — the issue just stays open silently. Check the logs for "asking reporter to clarify" to see this happening, or reply with the quality keyword directly based on which instance you know is affected.
 
 **Issue stuck waiting for an import that already happened (`CONFIRM_REPLACEMENT_IMPORT`)**
 - Remediarr tracks "awaiting import" state in memory only, per movie/episode. If the instance handling that file didn't have its own "On Import" webhook configured yet (see the per-instance note above if you run more than one Sonarr/Radarr), the confirmation that closes the issue never arrives — even though the file actually imported fine.
