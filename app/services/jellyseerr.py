@@ -30,9 +30,21 @@ async def jelly_fetch_issue(issue_id: int) -> Dict[str, Any]:
     issue_data = r.json()
     
     # Log the raw issue data to debug season/episode extraction
-    log.info("Raw Jellyseerr issue data for %s: affectedSeason=%s, affectedEpisode=%s", 
+    log.info("Raw Jellyseerr issue data for %s: affectedSeason=%s, affectedEpisode=%s",
              issue_id, issue_data.get("affectedSeason"), issue_data.get("affectedEpisode"))
-    
+
+    # Diagnostic for the multi-instance 4K case: log the raw serviceId/serviceId4k
+    # (and any top-level 4K-ish flag Seerr sends on the issue itself) exactly as
+    # Seerr reports them, separate from whatever handlers.py's _resolve_instance()
+    # decides to do with them. We don't yet have a confirmed real-world example of
+    # a title with BOTH populated (see PROJECT.md) — this is here to capture one.
+    media = issue_data.get("media") or {}
+    four_k_issue_keys = {k: v for k, v in issue_data.items() if "4k" in k.lower()}
+    log.info(
+        "Issue %s media serviceId=%s serviceId4k=%s; issue-level 4K-ish fields=%s",
+        issue_id, media.get("serviceId"), media.get("serviceId4k"), four_k_issue_keys or None,
+    )
+
     return issue_data
 
 def _extract_issue_context(issue_json: Dict[str, Any]) -> Dict[str, Any]:
