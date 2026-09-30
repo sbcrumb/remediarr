@@ -169,9 +169,11 @@ Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "
 | `CONFIRM_REPLACEMENT_IMPORT` | When `true`, Remediarr holds an issue open after triggering a re-download and only comments + closes once the replacement is confirmed imported. TV issues wait for Sonarr's On Import webhook; movie issues wait for Radarr's. If the download never lands, the issue stays open as a signal for manual follow-up. Requires the webhook setup below for each arr you want to confirm. Default `false`. | `false` |
 | `BLOCKLIST_ON_REPLACE` | When `true`, Remediarr marks the grab that produced the bad file as **failed** in Radarr/Sonarr before deleting it, which adds that release to the arr's **Blocklist**. The re-search then skips it instead of potentially grabbing the same broken release again. Blocklisting matches an exact release, not the content — a different upload of the same bad encode can still return. Entries stay until removed in *Activity → Blocklist*. Default `false`. | `false` |
 
+> **Running multiple Sonarr/Radarr instances?** (see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances)) Set this webhook up on **every** instance, not just the default one — they all point at the exact same Remediarr URL below. Remediarr matches a confirmation by the movie/episode id, not by which instance sent it, so it doesn't matter which instance's webhook fires — only that each one has it configured at all. A file remediated on an instance with no webhook configured will never auto-close; see [Issues not auto-closing / stuck open](#common-issues) below.
+
 #### Setting up the Sonarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true`)
 
-When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify it when a replacement file has been imported. Set this up once in Sonarr:
+When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify it when a replacement file has been imported. Set this up once **per Sonarr instance**:
 
 1. In Sonarr, go to **Settings → Connect → + (Add)**
 2. Choose **Webhook**
@@ -189,6 +191,8 @@ When `CONFIRM_REPLACEMENT_IMPORT` is enabled, Remediarr needs Sonarr to notify i
 > **Note:** Remediarr must be running as a single worker. If you run multiple workers (e.g. `gunicorn --workers 2`), pending import state is not shared between them and issues may not close correctly.
 
 #### Setting up the Radarr webhook (required for `CONFIRM_REPLACEMENT_IMPORT=true` on movies)
+
+Same as Sonarr above — set this up **per Radarr instance** if you run more than one.
 
 1. In Radarr, go to **Settings → Connect → + (Add)**
 2. Choose **Webhook**
@@ -325,6 +329,11 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 **Issue left open with a comment about an unconfigured instance**
 - Seerr reports an instance index Remediarr has no `SONARR_URL_N`/`RADARR_URL_N` for — add it, matching the order instances appear in Seerr's **Settings → Services**
 - This is deliberate, fail-loud behavior, not a bug — Remediarr won't guess and silently check the wrong instance
+
+**Issue stuck waiting for an import that already happened (`CONFIRM_REPLACEMENT_IMPORT`)**
+- Remediarr tracks "awaiting import" state in memory only, per movie/episode. If the instance handling that file didn't have its own "On Import" webhook configured yet (see the per-instance note above if you run more than one Sonarr/Radarr), the confirmation that closes the issue never arrives — even though the file actually imported fine.
+- Restarting the Remediarr container clears all pending "awaiting import" state. This is safe to do any time: it's purely in-memory, nothing else depends on it, and an issue with cleared pending state simply stays open rather than closing incorrectly — you may just need to close it manually if the underlying problem is already fixed.
+- Fix the webhook on the instance that was missing it so this doesn't happen on the next remediation.
 
 ### Debug Mode
 ```bash
