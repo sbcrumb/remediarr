@@ -8,9 +8,6 @@ from typing import Optional
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Hard-coded to prevent loops and user customization
-BOT_PREFIX = "[Remediarr]"
-
 
 def env_alias(new_name: str, old_name: str, default: str = "") -> str:
     """Read new_name, falling back to old_name for backward compat (e.g. SEERR_* vs legacy JELLYSEERR_*)."""
