@@ -159,6 +159,8 @@ Seerr supports pointing at more than one Sonarr/Radarr instance — a separate "
 
 **Day-to-day, there's nothing extra to do.** Once the instances are configured, routing is automatic on every issue — users report problems exactly the same way regardless of which instance their media lives on. `GET /health/detailed` also checks every configured instance, not just the default, so a misconfigured second instance shows up there before it shows up as a routing failure.
 
+**If a title exists on both a standard and a 4K instance**, Seerr reports the media as belonging to both at once, with nothing in the issue itself saying which version the report actually concerns — confirmed against real Seerr data, not assumed. Rather than guess (and risk "fixing" a copy that was never broken), Remediarr comments on the issue asking the reporter to reply with `4k` or `standard`, then picks up the fix from that reply. The keywords it looks for are customizable via `QUALITY_4K_KEYWORDS`/`QUALITY_STANDARD_KEYWORDS` (see [Keyword Customization](#keyword-customization)) — the reply can also just be included in the original report if the reporter already knows which version they mean, skipping the extra round-trip. Titles that only exist on one instance are unaffected.
+
 ### Optional Settings
 
 | Variable | Description | Example |
@@ -224,6 +226,11 @@ MOVIE_VIDEO_KEYWORDS="no video,video missing,bad video,black screen"
 MOVIE_SUBTITLE_KEYWORDS="missing subs,no subtitles,bad subtitles"
 MOVIE_OTHER_KEYWORDS="buffering,playback error,corrupt file"
 MOVIE_WRONG_KEYWORDS="wrong movie,incorrect movie,not the right movie"
+
+# Quality clarification keywords (only used when a title exists on both a
+# standard and 4K instance — see "Multiple Sonarr/Radarr Instances" above)
+QUALITY_4K_KEYWORDS="4k,4 k,uhd,2160p"
+QUALITY_STANDARD_KEYWORDS="1080p,1080,standard,regular,non-4k,non 4k,sd version,normal quality"
 ```
 
 ### Security Options
@@ -329,6 +336,11 @@ APPRISE_URLS="discord://webhook_id/webhook_token,slack://hook_url"
 **Issue left open with a comment about an unconfigured instance**
 - Seerr reports an instance index Remediarr has no `SONARR_URL_N`/`RADARR_URL_N` for — add it, matching the order instances appear in Seerr's **Settings → Services**
 - This is deliberate, fail-loud behavior, not a bug — Remediarr won't guess and silently check the wrong instance
+
+**Issue left open asking "4k or standard?"**
+- The title exists on both a standard and 4K instance and the report doesn't say which one is broken — see [Multiple Sonarr/Radarr Instances](#multiple-sonarrradarr-instances) above
+- Reply on the issue with `4k` or `standard` (or a word from `QUALITY_4K_KEYWORDS`/`QUALITY_STANDARD_KEYWORDS`) and Remediarr picks up the fix from there
+- Also deliberate, not a bug — same reasoning as the unconfigured-instance case above: Remediarr won't guess which copy to touch
 
 **Issue stuck waiting for an import that already happened (`CONFIRM_REPLACEMENT_IMPORT`)**
 - Remediarr tracks "awaiting import" state in memory only, per movie/episode. If the instance handling that file didn't have its own "On Import" webhook configured yet (see the per-instance note above if you run more than one Sonarr/Radarr), the confirmation that closes the issue never arrives — even though the file actually imported fine.
