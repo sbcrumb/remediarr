@@ -356,7 +356,7 @@ docker run --rm -p 8189:8189 --env-file .env remediarr:dev
 ## Container Images
 
 - **Latest stable**: `ghcr.io/sbcrumb/remediarr:latest`
-- **Version tagged**: `ghcr.io/sbcrumb/remediarr:0.2.6` (matches the current `VERSION` file — check [releases](https://github.com/sbcrumb/remediarr/releases) for the latest)
+- **Version tagged**: `ghcr.io/sbcrumb/remediarr:0.3.0` (matches the current `VERSION` file — check [releases](https://github.com/sbcrumb/remediarr/releases) for the latest)
 - **Development**: `ghcr.io/sbcrumb/remediarr:dev`
 
 ## Contributing
