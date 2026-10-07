@@ -25,34 +25,35 @@ async def health():
 
 @app.get("/health/detailed")
 async def health_detailed():
-    s_ok, s_detail = await sonarr_ok()
-    r_ok, r_detail = await radarr_ok()
+    s_results = await sonarr_ok()
+    r_results = await radarr_ok()
     b_ok, b_detail = await bazarr_ok()
-    
-    overall_ok = s_ok and r_ok and b_ok
-    
+
+    overall_ok = all(ok for ok, _ in s_results.values()) and all(ok for ok, _ in r_results.values()) and b_ok
+
+    services = {
+        name: {"status": "ok" if ok else "error", "detail": detail}
+        for name, (ok, detail) in {**s_results, **r_results}.items()
+    }
+    services["bazarr"] = {"status": "ok" if b_ok else "error", "detail": b_detail}
+
     return {
         "status": "ok" if overall_ok else "degraded",
-        "services": {
-            "sonarr": {"status": "ok" if s_ok else "error", "detail": s_detail},
-            "radarr": {"status": "ok" if r_ok else "error", "detail": r_detail},
-            "bazarr": {"status": "ok" if b_ok else "error", "detail": b_detail}
-        }
+        "services": services,
     }
 
 
 @app.on_event("startup")
 async def on_startup():
     log.info("%s v%s starting on %s:%s", cfg.APP_NAME, cfg.VERSION, cfg.APP_HOST, cfg.APP_PORT)
-    s_ok, s_detail = await sonarr_ok()
-    r_ok, r_detail = await radarr_ok()
+    s_results = await sonarr_ok()
+    r_results = await radarr_ok()
     b_ok, b_detail = await bazarr_ok()
-    msg = "\n".join([
-        f"{cfg.APP_NAME} v{cfg.VERSION} started.",
-        f"Sonarr health: {'OK' if s_ok else 'FAIL'} ({s_detail})",
-        f"Radarr health: {'OK' if r_ok else 'FAIL'} ({r_detail})",
-        f"Bazarr health: {'OK' if b_ok else 'FAIL'} ({b_detail})",
-    ])
+    lines = [f"{cfg.APP_NAME} v{cfg.VERSION} started."]
+    for name, (ok, detail) in {**s_results, **r_results}.items():
+        lines.append(f"{name.capitalize()} health: {'OK' if ok else 'FAIL'} ({detail})")
+    lines.append(f"Bazarr health: {'OK' if b_ok else 'FAIL'} ({b_detail})")
+    msg = "\n".join(lines)
     log.info(msg)
     if not cfg.DISABLE_STARTUP_NOTIFICATION:
         await notify(title=f"{cfg.APP_NAME} started", message=msg)

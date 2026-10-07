@@ -10,6 +10,7 @@ from app.services.jellyseerr import (
 from app.services import radarr as R
 from app.services import sonarr as S
 from app.services import bazarr as B
+from app.services.arr_instances import InstanceNotConfiguredError
 from app.services.notify import notify
 from app.config import cfg, env_alias
 
@@ -27,6 +28,80 @@ class AllSeasonsAmbiguousError(ValueError):
         else:
             reason = f"{season_count} seasons have files — too destructive"
         super().__init__(f"All Seasons selected for '{title}' ({reason}).")
+
+
+def _as_instance_index(val: Any) -> Optional[int]:
+    """Parse a Seerr serviceId-shaped value (int, numeric string, or null/bool
+    junk) into an instance index, or None if it isn't a usable index."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val.strip())
+    return None
+
+
+def _resolve_instance(media: Dict[str, Any]) -> int:
+    """Which configured Sonarr/Radarr instance owns this media, per Seerr's
+    own multi-instance indexing. Seerr reports this as media.serviceId (or
+    serviceId4k for a 4K request) — a 0-based index into however many
+    Sonarr/Radarr instances are configured on the Seerr side, in the order
+    they were added there. Only used when serviceId/serviceId4k aren't BOTH
+    present — see _resolve_instance_for_action for that ambiguous case, which
+    is real and confirmed (a title available on both a standard and 4K
+    instance reports both fields on the very same issue). Default to instance
+    0 when Seerr reports neither, matching pre-v3 single-instance behavior."""
+    media = media or {}
+    sid = _as_instance_index((media or {}).get("serviceId"))
+    if sid is not None:
+        return sid
+    sid4k = _as_instance_index((media or {}).get("serviceId4k"))
+    if sid4k is not None:
+        return sid4k
+    return 0
+
+
+# Explicit quality signal a reporter can give in a comment when a title exists
+# on both a standard and 4K instance and Seerr's issue data alone can't say
+# which one a report concerns (confirmed against real data: the issue payload
+# carries nothing 4K-specific at all — see PROJECT.md's v3 notes).
+QUALITY_4K_KEYWORDS_ENV = "QUALITY_4K_KEYWORDS"
+QUALITY_STANDARD_KEYWORDS_ENV = "QUALITY_STANDARD_KEYWORDS"
+
+
+def _quality_hint_from_text(text: str) -> Optional[str]:
+    """Scan free text (typically the reporter's own comment) for an explicit
+    quality signal. Returns "4k", "standard", or None if neither is present."""
+    if not text:
+        return None
+    t = text.lower()
+    if any(kw in t for kw in QUALITY_4K_KEYWORDS):
+        return "4k"
+    if any(kw in t for kw in QUALITY_STANDARD_KEYWORDS):
+        return "standard"
+    return None
+
+
+def _resolve_instance_for_action(media: Dict[str, Any], reporter_text: str) -> Tuple[Optional[int], bool]:
+    """Resolve the instance to actually act on, handling the ambiguous
+    both-serviceId-and-serviceId4k case explicitly instead of silently
+    guessing. Returns (instance, needs_clarification):
+      - needs_clarification=True means we genuinely can't tell which library
+        this report is about and instance is meaningless (None) — the caller
+        should ask the reporter rather than act.
+      - Otherwise instance is the index to use, resolved either from an
+        explicit quality keyword in reporter_text or (when unambiguous)
+        the normal single-value fallback in _resolve_instance."""
+    media = media or {}
+    sid = _as_instance_index(media.get("serviceId"))
+    sid4k = _as_instance_index(media.get("serviceId4k"))
+    if sid is not None and sid4k is not None and sid != sid4k:
+        hint = _quality_hint_from_text(reporter_text)
+        if hint is None:
+            return None, True
+        return (sid4k if hint == "4k" else sid), False
+    return _resolve_instance(media), False
 
 
 # env/config
@@ -51,23 +126,35 @@ TV_AUDIO = set(_csv("TV_AUDIO_KEYWORDS") or ["no audio", "no sound", "missing au
 TV_VIDEO = set(_csv("TV_VIDEO_KEYWORDS") or ["no video", "video glitch", "black screen", "stutter", "pixelation"])
 TV_SUBS = set(_csv("TV_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
 TV_OTHER = set(_csv("TV_OTHER_KEYWORDS") or ["buffering", "playback error", "corrupt file"])
+TV_WRONG = set(_csv("TV_WRONG_KEYWORDS") or ["not the right show", "wrong show", "incorrect show", "wrong episode", "incorrect episode", "not the right episode"])
 MOV_AUDIO = set(_csv("MOVIE_AUDIO_KEYWORDS") or ["no audio", "no sound", "audio issue"])
 MOV_VIDEO = set(_csv("MOVIE_VIDEO_KEYWORDS") or ["no video", "video missing", "bad video", "broken video", "black screen"])
 MOV_SUBS = set(_csv("MOVIE_SUBTITLE_KEYWORDS") or ["missing subs", "no subtitles", "bad subtitles", "wrong subs", "subs out of sync"])
 MOV_OTHER = set(_csv("MOVIE_OTHER_KEYWORDS") or ["buffering", "playback error", "corrupt file"])
 MOV_WRONG = set(_csv("MOVIE_WRONG_KEYWORDS") or ["not the right movie", "wrong movie", "incorrect movie"])
+QUALITY_4K_KEYWORDS = set(_csv(QUALITY_4K_KEYWORDS_ENV) or ["4k", "4 k", "uhd", "2160p"])
+QUALITY_STANDARD_KEYWORDS = set(_csv(QUALITY_STANDARD_KEYWORDS_ENV) or [
+    "1080p", "1080", "standard", "regular", "non-4k", "non 4k", "sd version", "normal quality",
+])
 
 def _bucket_for(text: str, media_type: Optional[str]) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-    
-    # Check for wrong movie first (movie-specific)
+
+    # Check for "wrong" first (movie or show/episode) - same reasoning as the
+    # TV_SUBS/MOV_SUBS "wrong subs" phrase below: checking wrong before the
+    # other buckets keeps "wrong episode" from being caught by some other
+    # bucket's substring first.
     if media_type == "movie":
         for keyword in MOV_WRONG:
             if keyword in t:
                 return "wrong"
-    
+    elif media_type in ("tv", "series"):
+        for keyword in TV_WRONG:
+            if keyword in t:
+                return "wrong"
+
     # Check other buckets using substring matching
     for keyword in (MOV_AUDIO | TV_AUDIO):
         if keyword in t:
@@ -255,7 +342,28 @@ def _is_all_episodes(value: Any) -> bool:
 # "title": str}. One episode can have several open issues (a re-open, or two people
 # reporting the same break); all of them close on the single import. In-memory and
 # best-effort: cleared on restart (a pending issue simply stays open — fail-safe).
+#
+# Known limitation (multi-instance, v3): this key is NOT instance-scoped.
+# series_id/movie_id are only unique within one Sonarr/Radarr instance's own
+# database, and Sonarr/Radarr's native "On Import" webhook carries no Seerr
+# serviceId concept to disambiguate which instance fired it. Two different
+# instances both happening to use the same series_id/movie_id for unrelated
+# shows/movies (very unlikely, but not impossible) could cross-wire a pending
+# entry. Deliberately left unfixed for now — the routing fix (v3 PR 2) matters
+# far more than this edge case, and instance-scoping this map would need every
+# import webhook to also identify which instance sent it, which Sonarr/Radarr
+# don't provide directly. Revisit if it ever actually bites someone.
 _PENDING_IMPORTS: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+
+# Multi-instance 4K ambiguity: issues waiting on the reporter to say which
+# library ("4k" or "standard") their report is about, keyed by issue_id ->
+# {"bucket": str, "title": str}. Needed because in keyword-scan mode
+# (ISSUE_TYPE_AS_BUCKET=false) the reply itself ("4k") won't match any bucket
+# keyword on its own — the bucket we already determined when we first asked
+# has to be remembered so the reply resumes the original fix instead of
+# dead-ending as "no actionable keywords". In-memory/best-effort like
+# _PENDING_IMPORTS: cleared on restart, issue simply stays open (fail-safe).
+_PENDING_INSTANCE_CLARIFICATION: Dict[int, Dict[str, Any]] = {}
 
 def _register_pending_import(series_id: int, season: int, episode: int,
                              issue_id: int, title: str) -> bool:
@@ -344,7 +452,7 @@ def _radarr_import_movie_id(payload: Dict[str, Any]) -> Optional[int]:
     return mid
 
 
-async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], int, int]:
+async def _tv_episode_from_payload(payload: Dict[str, Any], instance: int = 0) -> Tuple[int, Dict[str, Any], int, int]:
     """Returns (series_id, series, season, episode) where episode=0 means all episodes in season."""
     issue = payload.get("issue") or {}
     media = payload.get("media") or {}
@@ -443,7 +551,7 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
                     log.info("After payload walk: season=%s, episode=%s", season, episode)
 
     # Get series from Sonarr
-    series = await S.get_series_by_tvdb(int(tvdb_id))
+    series = await S.get_series_by_tvdb(int(tvdb_id), instance=instance)
     if not series:
         raise ValueError("Series not found in Sonarr")
 
@@ -461,7 +569,7 @@ async def _tv_episode_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[s
         #   1 season  → auto-target that one
         #   >1 season → refuse and leave a comment explaining why
         #   0 seasons → nothing to fix, comment + close
-        seasons_with_files = await S.get_seasons_with_files(series["id"])
+        seasons_with_files = await S.get_seasons_with_files(series["id"], instance=instance)
         if len(seasons_with_files) == 1:
             season = next(iter(seasons_with_files))
             log.info(
@@ -551,30 +659,30 @@ async def _handle_subtitle_with_bazarr(issue_id: int, media_type: str, media_id:
     return False
 
 
-async def _blocklist_movie(movie_id: int) -> None:
+async def _blocklist_movie(movie_id: int, instance: int = 0) -> None:
     """Blocklist the release behind the current file so the re-search can't grab it again."""
     if not cfg.BLOCKLIST_ON_REPLACE:
         return
     try:
-        blocked = await R.blocklist_current_release(movie_id)
+        blocked = await R.blocklist_current_release(movie_id, instance=instance)
         log.info("Blocklisted %s release(s) for movie %s", blocked, movie_id)
     except Exception as e:
         # Never let a blocklist failure block the delete + re-search.
         log.warning("Blocklist failed for movie %s: %s", movie_id, e)
 
 
-async def _blocklist_episodes(series_id: int, episode_ids: List[int]) -> None:
+async def _blocklist_episodes(series_id: int, episode_ids: List[int], instance: int = 0) -> None:
     """Blocklist the release(s) behind the current files so the re-search can't grab them again."""
     if not cfg.BLOCKLIST_ON_REPLACE or not episode_ids:
         return
     try:
-        blocked = await S.blocklist_current_releases(series_id, episode_ids)
+        blocked = await S.blocklist_current_releases(series_id, episode_ids, instance=instance)
         log.info("Blocklisted %s release(s) for series %s episodes %s", blocked, series_id, episode_ids)
     except Exception as e:
         log.warning("Blocklist failed for series %s episodes %s: %s", series_id, episode_ids, e)
 
 
-async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> None:
+async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str, instance: int = 0) -> None:
     movie_id = movie["id"]
     title = movie.get("title") or f"Movie {movie_id}"
     
@@ -599,12 +707,12 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
     # Delete + re-search unless a remediation for this movie is already in flight.
     if not already_pending:
         if bucket in ("audio", "video", "subtitle", "wrong"):
-            await _blocklist_movie(movie_id)
+            await _blocklist_movie(movie_id, instance=instance)
             log.info("Deleting movie files for movie %s", movie_id)
-            removed = await R.delete_moviefiles(movie_id)
+            removed = await R.delete_moviefiles(movie_id, instance=instance)
             log.info("Deleted %s movie files", removed)
         log.info("Triggering search for movie %s", movie_id)
-        await R.trigger_search_movie(movie_id)
+        await R.trigger_search_movie(movie_id, instance=instance)
 
     # Confirm-import mode: register the issue as pending and post an interim comment.
     # The Radarr "On Import" webhook (handle_radarr_import) finalizes it once the
@@ -627,7 +735,7 @@ async def _handle_movie(issue_id: int, movie: Dict[str, Any], bucket: str) -> No
 
     await notify("Remediarr - Movie", f"{title}: fixed")
 
-async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str) -> None:
+async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], season: int, episodes: List[int], bucket: str, instance: int = 0) -> None:
     series_id = series["id"]
     title = series.get("title") or f"Series {series_id}"
 
@@ -635,7 +743,7 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
     handled_eps: List[Tuple[int, List[int]]] = []
 
     for ep_num in episodes:
-        ep_ids = await S.episode_ids_for(series_id, season, ep_num)
+        ep_ids = await S.episode_ids_for(series_id, season, ep_num, instance=instance)
         if not ep_ids:
             log.info("No episode file in Sonarr for S%02dE%02d, skipping", season, ep_num)
             continue
@@ -646,11 +754,11 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
         log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
         return
 
-    if bucket in ("audio", "video", "subtitle"):
+    if bucket in ("audio", "video", "subtitle", "wrong"):
         # Blocklist all reported episodes in ONE pass before deleting: episodes from
         # the same season pack share a downloadId, and marking that grab failed twice
         # would double-blocklist it and fire a second redownload.
-        await _blocklist_episodes(series_id, all_episode_ids)
+        await _blocklist_episodes(series_id, all_episode_ids, instance=instance)
         for ep_num, ep_ids in handled_eps:
             # One episode's delete failing (e.g. a Sonarr timeout) shouldn't abort
             # the whole batch — every other episode here was just blocklisted above,
@@ -658,12 +766,12 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
             # blocklisted but never actually deleted/re-searched, which is worse
             # than not blocklisting at all.
             try:
-                removed = await S.delete_episodefiles(series_id, ep_ids)
+                removed = await S.delete_episodefiles(series_id, ep_ids, instance=instance)
                 log.info("Deleted %s files for S%02dE%02d", removed, season, ep_num)
             except Exception as e:
                 log.warning("Failed to delete files for S%02dE%02d: %s", season, ep_num, e)
 
-    await S.trigger_episode_search(all_episode_ids)
+    await S.trigger_episode_search(all_episode_ids, instance=instance)
 
     ep_list = ", ".join(f"E{e:02d}" for e, _ in handled_eps)
     msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
@@ -675,7 +783,7 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
     await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
 
 
-async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str) -> None:
+async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str, instance: int = 0) -> None:
     series_id = series["id"]
     title = series.get("title") or f"Series {series_id}"
 
@@ -690,12 +798,13 @@ async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, 
                 return
         log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
 
-    if bucket in ("audio", "video", "subtitle"):
-        await _blocklist_episodes(series_id, await S.get_all_episode_ids_for_season(series_id, season))
-        removed = await S.delete_all_episodefiles_for_season(series_id, season)
+    if bucket in ("audio", "video", "subtitle", "wrong"):
+        all_ids = await S.get_all_episode_ids_for_season(series_id, season, instance=instance)
+        await _blocklist_episodes(series_id, all_ids, instance=instance)
+        removed = await S.delete_all_episodefiles_for_season(series_id, season, instance=instance)
         log.info("Deleted %s episode files for series %s season %s", removed, series_id, season)
 
-    await S.trigger_season_search(series_id, season)
+    await S.trigger_season_search(series_id, season, instance=instance)
     log.info("Triggered SeasonSearch for series %s season %s", series_id, season)
 
     msg = f"{title} Season {season:02d}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
@@ -708,7 +817,7 @@ async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, 
     await notify(f"Remediarr - TV Season", f"{title} Season {season}: fixed")
 
 
-async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str) -> None:
+async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str, instance: int = 0) -> None:
     series_id = series["id"]
     title = series.get("title") or f"Series {series_id}"
     
@@ -733,7 +842,7 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     # and it falls through to the normal comment+close below. NB Bazarr-handled
     # subtitle fixes return early above and always close at action time (a Bazarr
     # search produces no Sonarr import to wait for).
-    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle")
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle", "wrong")
     already_pending = confirm and (series_id, season, episode) in _PENDING_IMPORTS
 
     # Delete + re-search — unless a remediation for this exact episode is already in
@@ -741,13 +850,13 @@ async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode
     # just attach this issue to the existing pending entry below.
     if not already_pending:
         removed = 0
-        if bucket in ("audio", "video", "subtitle"):
-            await _blocklist_episodes(series_id, episode_ids)
+        if bucket in ("audio", "video", "subtitle", "wrong"):
+            await _blocklist_episodes(series_id, episode_ids, instance=instance)
             log.info("Deleting episode files for series %s, episodes %s", series_id, episode_ids)
-            removed = await S.delete_episodefiles(series_id, episode_ids)
+            removed = await S.delete_episodefiles(series_id, episode_ids, instance=instance)
             log.info("Deleted %s episode files", removed)
         log.info("Triggering search for series %s episodes %s", series_id, episode_ids)
-        await S.trigger_episode_search(episode_ids)
+        await S.trigger_episode_search(episode_ids, instance=instance)
 
     # Confirm-import mode: don't claim success/close yet. Register the issue as
     # pending and post an interim comment; the Sonarr "On Import" webhook
@@ -923,6 +1032,14 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         bucket = _bucket_for(last, media_type)
         log.info("Keyword scan: %r -> bucket=%s", last, bucket)
 
+    # A reply that's only a quality clarification ("4k"/"standard") won't match
+    # any bucket keyword on its own in keyword-scan mode — reuse the bucket we
+    # remembered from when we originally asked, so the reply resumes the fix
+    # instead of dead-ending as "no actionable keywords".
+    if not bucket and issue_id in _PENDING_INSTANCE_CLARIFICATION and _quality_hint_from_text(last):
+        bucket = _PENDING_INSTANCE_CLARIFICATION[issue_id]["bucket"]
+        log.info("Issue %s: clarification reply resolves to remembered bucket=%s", issue_id, bucket)
+
     # No bucket → coach the user if coaching is enabled
     if not bucket:
         # In issue-type mode the comment/keywords are irrelevant; don't post the
@@ -961,7 +1078,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
                     keywords = list(TV_OTHER)[:5]
                 else:
                     # If issue type unknown, show a mix but prioritize common ones
-                    keywords = list(TV_VIDEO)[:2] + list(TV_AUDIO)[:2] + list(TV_SUBS)[:2]
+                    keywords = list(TV_VIDEO)[:2] + list(TV_AUDIO)[:2] + list(TV_WRONG)[:2]
             else:
                 keywords = ["specific issue keywords"]
             
@@ -976,6 +1093,34 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         
         return {"ok": True, "detail": "ignored: no actionable keywords"}
 
+    # Multi-instance 4K ambiguity: confirmed against real Seerr data that a
+    # title available on both a standard and 4K instance reports BOTH
+    # serviceId and serviceId4k on the very same issue, with nothing on the
+    # issue itself saying which version the report concerns — Seerr attaches
+    # issues to the title, not to a specific quality tier. Rather than guess
+    # (and risk "fixing" a copy that was never broken while the real one stays
+    # broken), look for an explicit quality keyword in the reporter's own
+    # comment; if it's not there, ask instead of acting.
+    instance, needs_clarification = _resolve_instance_for_action(media, last)
+    if needs_clarification:
+        sid = media.get("serviceId")
+        sid4k = media.get("serviceId4k")
+        title_hint = media.get("title") or media.get("name") or "this title"
+        _PENDING_INSTANCE_CLARIFICATION[issue_id] = {"bucket": bucket, "title": title_hint}
+        log.info("Issue %s: ambiguous instance (serviceId=%s serviceId4k=%s) — asking reporter to clarify",
+                 issue_id, sid, sid4k)
+        if COMMENT_ON_ACTION:
+            msg = (
+                f"{PREFIX} {title_hint} is available on both a standard and a 4K library here, and I "
+                f"can't tell which one this report is about. Reply with \"4k\" or \"standard\" and I'll "
+                f"pick this up from there."
+            )
+            await jelly_comment(issue_id, msg)
+        return {"ok": True, "detail": "ignored: ambiguous instance (4k vs standard), awaiting clarification"}
+
+    # Resolved (possibly via a clarification reply) — clear any pending entry.
+    _PENDING_INSTANCE_CLARIFICATION.pop(issue_id, None)
+
     # Cooldown guard
     if _under_cooldown(issue_id):
         return {"ok": True, "detail": "ignored: cooldown"}
@@ -986,14 +1131,22 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
             log.info("Movie issue lacks TMDB; skipping.")
             return {"ok": True, "detail": "ignored: missing tmdb id"}
 
-        movie = await R.get_movie_by_tmdb(int(tmdb))
+        try:
+            movie = await R.get_movie_by_tmdb(int(tmdb), instance=instance)
+        except InstanceNotConfiguredError as e:
+            log.warning("Movie issue %s targets unconfigured Radarr instance %s: %s", issue_id, instance, e)
+            if COMMENT_ON_ACTION:
+                await jelly_comment(issue_id, f"{PREFIX} This request is on a Radarr instance (index {instance}) "
+                                    f"that isn't configured on remediarr — an admin needs to add "
+                                    f"RADARR_URL_{instance}/RADARR_API_KEY_{instance}. Leaving this issue open.")
+            return {"ok": True, "detail": f"ignored: radarr instance {instance} not configured"}
         if not movie:
             log.info("Radarr: movie not found locally; skipping.")
             return {"ok": True, "detail": "ignored: movie not in radarr"}
 
-        log.info("Processing movie %s (%s) with bucket: %s", movie["id"], movie.get("title"), bucket)
-        
-        await _handle_movie(issue_id, movie, bucket)
+        log.info("Processing movie %s (%s) with bucket: %s (instance=%s)", movie["id"], movie.get("title"), bucket, instance)
+
+        await _handle_movie(issue_id, movie, bucket, instance=instance)
         _bump_cooldown(issue_id)
         return {"ok": True, "detail": f"movie handled: {bucket}"}
 
@@ -1006,9 +1159,16 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             # Use the robust extraction method from original app.py with enriched payload
             # episode=0 is the sentinel meaning "all episodes in season"
-            series_id, series, season, episode = await _tv_episode_from_payload(enriched_payload)
-            log.info("Successfully extracted TV context: series_id=%s, S%02d E%s",
-                     series_id, season, "all" if episode == 0 else f"{episode:02d}")
+            series_id, series, season, episode = await _tv_episode_from_payload(enriched_payload, instance=instance)
+            log.info("Successfully extracted TV context: series_id=%s, S%02d E%s (instance=%s)",
+                     series_id, season, "all" if episode == 0 else f"{episode:02d}", instance)
+        except InstanceNotConfiguredError as e:
+            log.warning("TV issue %s targets unconfigured Sonarr instance %s: %s", issue_id, instance, e)
+            if COMMENT_ON_ACTION:
+                await jelly_comment(issue_id, f"{PREFIX} This request is on a Sonarr instance (index {instance}) "
+                                    f"that isn't configured on remediarr — an admin needs to add "
+                                    f"SONARR_URL_{instance}/SONARR_API_KEY_{instance}. Leaving this issue open.")
+            return {"ok": True, "detail": f"ignored: sonarr instance {instance} not configured"}
         except AllSeasonsAmbiguousError as e:
             log.info("TV extraction skipped: %s", e)
             if COMMENT_ON_ACTION:
@@ -1045,17 +1205,17 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             if specific_eps:
                 log.info("Found specific episodes in text for S%02d: %s — handling individually", season, specific_eps)
-                await _handle_tv_specific_episodes(issue_id, series, season, specific_eps, bucket)
+                await _handle_tv_specific_episodes(issue_id, series, season, specific_eps, bucket, instance=instance)
                 _bump_cooldown(issue_id)
                 return {"ok": True, "detail": f"tv specific episodes handled: {bucket}"}
 
             log.info("Processing TV series %s (%s) S%02d (all episodes) with bucket: %s",
                      series_id, series.get("title"), season, bucket)
-            await _handle_tv_season(issue_id, series, season, bucket)
+            await _handle_tv_season(issue_id, series, season, bucket, instance=instance)
             _bump_cooldown(issue_id)
             return {"ok": True, "detail": f"tv season handled: {bucket}"}
 
-        episode_ids = await S.episode_ids_for(series_id, season, episode)
+        episode_ids = await S.episode_ids_for(series_id, season, episode, instance=instance)
         if not episode_ids:
             log.info("Sonarr: no episode ids for S%02dE%02d", season, episode)
             return {"ok": True, "detail": "ignored: episode not present"}
@@ -1063,7 +1223,7 @@ async def handle_jellyseerr(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Processing TV series %s (%s) S%02dE%02d with bucket: %s",
                  series_id, series.get("title"), season, episode, bucket)
 
-        await _handle_tv(issue_id, series, season, episode, episode_ids, bucket)
+        await _handle_tv(issue_id, series, season, episode, episode_ids, bucket, instance=instance)
         _bump_cooldown(issue_id)
         return {"ok": True, "detail": f"tv handled: {bucket}"}
 
