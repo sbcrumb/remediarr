@@ -388,6 +388,47 @@ def _register_pending_import(series_id: int, season: int, episode: int,
              len(_PENDING_IMPORTS))
     return fresh
 
+# CONFIRM_REPLACEMENT_IMPORT for a season or multi-episode fix: one issue has to
+# wait on SEVERAL episodes importing, not just one, so _register_pending_import's
+# one-key-per-issue model doesn't fit — an issue registered under N keys would
+# otherwise get N separate "imported" comments and N close attempts as each
+# episode's import webhook lands. Keyed by issue_id -> {"remaining": set of
+# (series_id, season, episode) still outstanding, "title": str, "label": str}
+# (label is how the final comment refers to the batch, e.g. "Season 02" or
+# "S02 (E01, E03)"). handle_sonarr_import only finalizes the issue once
+# "remaining" is empty. Same in-memory/best-effort/fail-safe caveat as
+# _PENDING_IMPORTS.
+_PENDING_IMPORT_GROUPS: Dict[int, Dict[str, Any]] = {}
+
+def _register_pending_import_group(series_id: int, season: int, episodes: List[int],
+                                    issue_id: int, title: str, label: str) -> List[int]:
+    """Arm an issue to be closed only once every one of `episodes` has
+    imported — the season/multi-episode counterpart to
+    _register_pending_import. Each individual episode still shares
+    _PENDING_IMPORTS with the single-episode path, so a concurrent
+    single-episode issue on the same episode merges normally.
+
+    Returns the episode numbers that are genuinely new remediations (the
+    caller should delete + re-search only those); an episode already being
+    remediated by another in-flight issue is merged into that work instead
+    of being re-deleted.
+    """
+    fresh: List[int] = []
+    remaining: set = set()
+    for ep in episodes:
+        key = (series_id, season, ep)
+        remaining.add(key)
+        existing = _PENDING_IMPORTS.get(key)
+        if existing is None:
+            _PENDING_IMPORTS[key] = {"issue_ids": {issue_id}, "title": title}
+            fresh.append(ep)
+        else:
+            existing["issue_ids"].add(issue_id)
+    _PENDING_IMPORT_GROUPS[issue_id] = {"remaining": remaining, "title": title, "label": label}
+    log.info("Awaiting Sonarr import to confirm issue %s (%s %s) — %d/%d episode(s) new remediation, %d episode(s) pending for this issue",
+              issue_id, title, label, len(fresh), len(episodes), len(remaining))
+    return fresh
+
 def _sonarr_import_keys(payload: Dict[str, Any]) -> List[Tuple[int, int, int]]:
     """Extract (series_id, season, episode) keys from a Sonarr Connect webhook.
 
@@ -754,6 +795,15 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
         log.info("No matching episode files found in Sonarr for S%02d eps %s", season, episodes)
         return
 
+    ep_list = ", ".join(f"E{e:02d}" for e, _ in handled_eps)
+    label = f"S{season:02d} ({ep_list})"
+
+    # Confirm-import mode applies only to the replace buckets (audio/video/
+    # subtitle/wrong) — see _handle_tv's identical comment for why.
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle", "wrong")
+    if confirm:
+        _register_pending_import_group(series_id, season, [e for e, _ in handled_eps], issue_id, title, label)
+
     if bucket in ("audio", "video", "subtitle", "wrong"):
         # Blocklist all reported episodes in ONE pass before deleting: episodes from
         # the same season pack share a downloadId, and marking that grab failed twice
@@ -773,14 +823,23 @@ async def _handle_tv_specific_episodes(issue_id: int, series: Dict[str, Any], se
 
     await S.trigger_episode_search(all_episode_ids, instance=instance)
 
-    ep_list = ", ".join(f"E{e:02d}" for e, _ in handled_eps)
-    msg = f"{title} S{season:02d} ({ep_list}): replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    # Confirm-import mode: don't claim success/close yet. The Sonarr "On
+    # Import" webhook (handle_sonarr_import) finalizes it once every
+    # episode above has actually imported.
+    if confirm:
+        if COMMENT_ON_ACTION:
+            msg = f"{title} {label}: deleted the file(s) and started re-download(s). I'll comment here once the replacements have imported."
+            await jelly_comment(issue_id, f"{PREFIX} {msg}")
+        await notify(f"Remediarr - TV", f"{title} {label}: re-download started; awaiting import")
+        return
+
+    msg = f"{title} {label}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
-    await notify(f"Remediarr - TV", f"{title} S{season:02d} {ep_list}: fixed")
+    await notify(f"Remediarr - TV", f"{title} {label}: fixed")
 
 
 async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, bucket: str, instance: int = 0) -> None:
@@ -798,6 +857,21 @@ async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, 
                 return
         log.info("Falling back to traditional subtitle handling for series %s season %s", series_id, season)
 
+    label = f"Season {season:02d}"
+
+    # Confirm-import mode applies only to the replace buckets (audio/video/
+    # subtitle/wrong) — see _handle_tv's identical comment for why. The
+    # episode numbers to wait on have to be read BEFORE deleting anything —
+    # hasFile flips false the moment a file's gone.
+    confirm = cfg.CONFIRM_REPLACEMENT_IMPORT and bucket in ("audio", "video", "subtitle", "wrong")
+    if confirm:
+        episode_nums = await S.get_episode_numbers_with_files_for_season(series_id, season, instance=instance)
+        if episode_nums:
+            _register_pending_import_group(series_id, season, episode_nums, issue_id, title, label)
+        else:
+            log.info("No episode files in Sonarr for series %s season %s; nothing to confirm-wait on", series_id, season)
+            confirm = False
+
     if bucket in ("audio", "video", "subtitle", "wrong"):
         all_ids = await S.get_all_episode_ids_for_season(series_id, season, instance=instance)
         await _blocklist_episodes(series_id, all_ids, instance=instance)
@@ -807,14 +881,24 @@ async def _handle_tv_season(issue_id: int, series: Dict[str, Any], season: int, 
     await S.trigger_season_search(series_id, season, instance=instance)
     log.info("Triggered SeasonSearch for series %s season %s", series_id, season)
 
-    msg = f"{title} Season {season:02d}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
+    # Confirm-import mode: don't claim success/close yet. The Sonarr "On
+    # Import" webhook (handle_sonarr_import) finalizes it once every episode
+    # registered above has actually imported.
+    if confirm:
+        if COMMENT_ON_ACTION:
+            msg = f"{title} {label}: deleted the files and started a re-download. I'll comment here once the replacements have imported."
+            await jelly_comment(issue_id, f"{PREFIX} {msg}")
+        await notify(f"Remediarr - TV Season", f"{title} {label}: re-download started; awaiting import")
+        return
+
+    msg = f"{title} {label}: replaced files; new downloads grabbed. Closing this issue. If anything's still off, comment and I'll take another pass."
     if COMMENT_ON_ACTION:
         await jelly_comment(issue_id, f"{PREFIX} {msg}")
     if CLOSE_ISSUES:
         closed = await jelly_close(issue_id)
         log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
 
-    await notify(f"Remediarr - TV Season", f"{title} Season {season}: fixed")
+    await notify(f"Remediarr - TV Season", f"{title} {label}: fixed")
 
 
 async def _handle_tv(issue_id: int, series: Dict[str, Any], season: int, episode: int, episode_ids: List[int], bucket: str, instance: int = 0) -> None:
@@ -909,6 +993,33 @@ async def handle_sonarr_import(payload: Dict[str, Any]) -> Dict[str, Any]:
         # re-close one that already closed.
         failed = set()
         for issue_id in issue_ids:
+            # A season/multi-episode issue is grouped — it waits on several
+            # keys, not just this one, and only finalizes once all of them
+            # have imported. See _PENDING_IMPORT_GROUPS.
+            group = _PENDING_IMPORT_GROUPS.get(issue_id)
+            if group is not None:
+                group["remaining"].discard(key)
+                if group["remaining"]:
+                    log.info("Issue %s (%s %s): S%02dE%02d imported, %d episode(s) still pending",
+                             issue_id, title, group["label"], season, episode, len(group["remaining"]))
+                    continue
+                label = group["label"]
+                try:
+                    if COMMENT_ON_ACTION:
+                        msg = f"{title} {label}: replacement(s) downloaded and imported. Closing this issue. If anything's still off, comment and I'll take another pass."
+                        await jelly_comment(issue_id, f"{PREFIX} {msg}")
+                    if CLOSE_ISSUES:
+                        closed = await jelly_close(issue_id)
+                        log.info("Issue %s close attempt: %s", issue_id, "success" if closed else "failed")
+                    _PENDING_IMPORT_GROUPS.pop(issue_id, None)
+                except Exception as e:
+                    log.warning("Finalize failed for grouped issue %s (%s %s); will retry on next import for S%02dE%02d: %s",
+                                issue_id, title, label, season, episode, e)
+                    failed.add(issue_id)
+                    # group is left registered (not popped), already-empty
+                    # remaining; re-arming just this key lets a duplicate/
+                    # future import for this episode retry the finalize.
+                continue
             try:
                 if COMMENT_ON_ACTION:
                     msg = MSG_TV_IMPORTED.format(title=title, season=season, episode=episode)
