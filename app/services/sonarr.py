@@ -64,6 +64,17 @@ async def get_all_episode_ids_for_season(series_id: int, season: int, instance: 
     eps = await list_episodes(series_id, instance)
     return [e["id"] for e in eps if e.get("seasonNumber") == season and isinstance(e.get("id"), int)]
 
+async def get_episode_numbers_with_files_for_season(series_id: int, season: int, instance: int = 0) -> List[int]:
+    """Episode numbers in this season that currently have a file on disk — the
+    ones a season-wide remediation is about to delete and re-grab, and so the
+    ones CONFIRM_REPLACEMENT_IMPORT needs to wait on. Must be read before
+    deleting (hasFile flips false the moment the file's gone)."""
+    eps = await list_episodes(series_id, instance)
+    return sorted({
+        e["episodeNumber"] for e in eps
+        if e.get("seasonNumber") == season and e.get("hasFile") and isinstance(e.get("episodeNumber"), int)
+    })
+
 async def delete_episodefiles(series_id: int, episode_ids: List[int], instance: int = 0) -> int:
     inst = _instance(instance)
     eps = await list_episodes(series_id, instance)

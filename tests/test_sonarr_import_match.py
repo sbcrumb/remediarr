@@ -82,8 +82,10 @@ def mocked_io(monkeypatch):
     monkeypatch.setattr(handlers, "CLOSE_ISSUES", True)
     monkeypatch.setattr(handlers, "COMMENT_ON_ACTION", True)
     handlers._PENDING_IMPORTS.clear()
+    handlers._PENDING_IMPORT_GROUPS.clear()
     yield calls
     handlers._PENDING_IMPORTS.clear()
+    handlers._PENDING_IMPORT_GROUPS.clear()
 
 
 def test_import_confirms_pending_issue_comments_and_closes(mocked_io):
@@ -267,3 +269,162 @@ def test_comment_off_still_closes_and_pops(mocked_io, monkeypatch):
     assert mocked_io["close"] == [777]                       # closed
     assert mocked_io["comment"] == []                        # but silent
     assert (12, 4, 6) not in handlers._PENDING_IMPORTS
+
+
+# --- Season/multi-episode confirm-import grouping ---------------------------
+# A season or multi-episode fix waits on several (series_id, season, episode)
+# keys for one issue — _PENDING_IMPORT_GROUPS — and must only comment/close
+# once ALL of them have imported, not once per episode.
+
+def test_register_pending_import_group_tracks_all_keys_and_returns_fresh(mocked_io):
+    fresh = handlers._register_pending_import_group(12, 4, [6, 7], 777, "From", "S04 (E06, E07)")
+
+    assert fresh == [6, 7]
+    assert handlers._PENDING_IMPORTS[(12, 4, 6)]["issue_ids"] == {777}
+    assert handlers._PENDING_IMPORTS[(12, 4, 7)]["issue_ids"] == {777}
+    assert handlers._PENDING_IMPORT_GROUPS[777]["remaining"] == {(12, 4, 6), (12, 4, 7)}
+
+
+def test_register_pending_import_group_merges_already_pending_episode(mocked_io):
+    handlers._register_pending_import(12, 4, 6, 606, "From")  # E06 already in flight
+
+    fresh = handlers._register_pending_import_group(12, 4, [6, 7], 777, "From", "S04 (E06, E07)")
+
+    assert fresh == [7]                                        # only E07 is new
+    assert handlers._PENDING_IMPORTS[(12, 4, 6)]["issue_ids"] == {606, 777}
+    assert handlers._PENDING_IMPORTS[(12, 4, 7)]["issue_ids"] == {777}
+
+
+def test_grouped_issue_does_not_finalize_until_every_episode_imports(mocked_io):
+    handlers._register_pending_import_group(12, 4, [6, 7], 777, "From", "S04 (E06, E07)")
+
+    e6 = {"eventType": "Download", "series": {"id": 12, "title": "From"},
+          "episodes": [{"seasonNumber": 4, "episodeNumber": 6}]}
+    asyncio.run(handlers.handle_sonarr_import(e6))
+
+    assert mocked_io["close"] == []                            # not yet — E07 still out
+    assert mocked_io["comment"] == []
+    assert 777 in handlers._PENDING_IMPORT_GROUPS
+    assert handlers._PENDING_IMPORT_GROUPS[777]["remaining"] == {(12, 4, 7)}
+
+    e7 = {"eventType": "Download", "series": {"id": 12, "title": "From"},
+          "episodes": [{"seasonNumber": 4, "episodeNumber": 7}]}
+    asyncio.run(handlers.handle_sonarr_import(e7))
+
+    assert mocked_io["close"] == [777]                         # now it finalizes, once
+    assert len(mocked_io["comment"]) == 1
+    assert 777 not in handlers._PENDING_IMPORT_GROUPS
+
+
+def test_grouped_issue_finalizes_in_one_batch_import_event(mocked_io):
+    # A season-pack import often lands as one Sonarr webhook listing every
+    # episode at once rather than one call per episode.
+    handlers._register_pending_import_group(12, 4, [6, 7], 777, "From", "S04 (E06, E07)")
+    payload = {"eventType": "Download", "series": {"id": 12, "title": "From"},
+               "episodes": [{"seasonNumber": 4, "episodeNumber": 6},
+                            {"seasonNumber": 4, "episodeNumber": 7}]}
+
+    asyncio.run(handlers.handle_sonarr_import(payload))
+
+    assert mocked_io["close"] == [777]
+    assert len(mocked_io["comment"]) == 1
+
+
+def test_handle_tv_season_confirm_mode_registers_group_and_does_not_close(mocked_io, monkeypatch):
+    async def fake_episode_numbers(series_id, season, instance=0):
+        return [1, 2]
+
+    async def fake_all_ids(series_id, season, instance=0):
+        return [101, 102]
+
+    async def fake_delete_all(series_id, season, instance=0):
+        return 2
+
+    async def fake_season_search(series_id, season, instance=0):
+        return None
+
+    monkeypatch.setattr(handlers.S, "get_episode_numbers_with_files_for_season", fake_episode_numbers)
+    monkeypatch.setattr(handlers.S, "get_all_episode_ids_for_season", fake_all_ids)
+    monkeypatch.setattr(handlers.S, "delete_all_episodefiles_for_season", fake_delete_all)
+    monkeypatch.setattr(handlers.S, "trigger_season_search", fake_season_search)
+    monkeypatch.setattr(handlers.cfg, "CONFIRM_REPLACEMENT_IMPORT", True)
+
+    series = {"id": 12, "title": "From", "tvdbId": 111}
+    asyncio.run(handlers._handle_tv_season(777, series, 4, "audio"))
+
+    assert handlers._PENDING_IMPORT_GROUPS[777]["remaining"] == {(12, 4, 1), (12, 4, 2)}
+    assert mocked_io["comment"] and "re-download" in mocked_io["comment"][0][1].lower()
+    assert mocked_io["close"] == []                            # NOT closed at search time
+
+
+def test_handle_tv_season_flag_off_closes_at_search_time(mocked_io, monkeypatch):
+    async def fake_all_ids(series_id, season, instance=0):
+        return [101, 102]
+
+    async def fake_delete_all(series_id, season, instance=0):
+        return 2
+
+    async def fake_season_search(series_id, season, instance=0):
+        return None
+
+    monkeypatch.setattr(handlers.S, "get_all_episode_ids_for_season", fake_all_ids)
+    monkeypatch.setattr(handlers.S, "delete_all_episodefiles_for_season", fake_delete_all)
+    monkeypatch.setattr(handlers.S, "trigger_season_search", fake_season_search)
+    monkeypatch.setattr(handlers.cfg, "CONFIRM_REPLACEMENT_IMPORT", False)
+
+    series = {"id": 12, "title": "From", "tvdbId": 111}
+    asyncio.run(handlers._handle_tv_season(777, series, 4, "audio"))
+
+    assert mocked_io["close"] == [777]                         # unchanged default behavior
+    assert handlers._PENDING_IMPORT_GROUPS == {}
+
+
+def test_handle_tv_season_confirm_mode_with_no_files_falls_back_to_immediate_close(mocked_io, monkeypatch):
+    # Nothing to wait on (e.g. the season has no files at all) — close now,
+    # same as flag-off, instead of registering an empty/unfinishable group.
+    async def fake_episode_numbers(series_id, season, instance=0):
+        return []
+
+    async def fake_all_ids(series_id, season, instance=0):
+        return []
+
+    async def fake_delete_all(series_id, season, instance=0):
+        return 0
+
+    async def fake_season_search(series_id, season, instance=0):
+        return None
+
+    monkeypatch.setattr(handlers.S, "get_episode_numbers_with_files_for_season", fake_episode_numbers)
+    monkeypatch.setattr(handlers.S, "get_all_episode_ids_for_season", fake_all_ids)
+    monkeypatch.setattr(handlers.S, "delete_all_episodefiles_for_season", fake_delete_all)
+    monkeypatch.setattr(handlers.S, "trigger_season_search", fake_season_search)
+    monkeypatch.setattr(handlers.cfg, "CONFIRM_REPLACEMENT_IMPORT", True)
+
+    series = {"id": 12, "title": "From", "tvdbId": 111}
+    asyncio.run(handlers._handle_tv_season(777, series, 4, "audio"))
+
+    assert mocked_io["close"] == [777]
+    assert handlers._PENDING_IMPORT_GROUPS == {}
+
+
+def test_handle_tv_specific_episodes_confirm_mode_registers_group(mocked_io, monkeypatch):
+    async def fake_episode_ids_for(series_id, season, episode, instance=0):
+        return [100 + episode]
+
+    async def fake_delete(series_id, episode_ids, instance=0):
+        return len(episode_ids)
+
+    async def fake_search(episode_ids, instance=0):
+        return None
+
+    monkeypatch.setattr(handlers.S, "episode_ids_for", fake_episode_ids_for)
+    monkeypatch.setattr(handlers.S, "delete_episodefiles", fake_delete)
+    monkeypatch.setattr(handlers.S, "trigger_episode_search", fake_search)
+    monkeypatch.setattr(handlers.cfg, "CONFIRM_REPLACEMENT_IMPORT", True)
+
+    series = {"id": 12, "title": "From", "tvdbId": 111}
+    asyncio.run(handlers._handle_tv_specific_episodes(777, series, 4, [6, 7], "video"))
+
+    assert handlers._PENDING_IMPORT_GROUPS[777]["remaining"] == {(12, 4, 6), (12, 4, 7)}
+    assert mocked_io["close"] == []
+    assert mocked_io["comment"] and "re-download" in mocked_io["comment"][0][1].lower()
